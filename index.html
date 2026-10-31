@@ -503,6 +503,25 @@ main{max-width:1400px;margin:0 auto;padding:96px 28px 130px}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.001s!important;transition-duration:.001s!important}
 }
+/* Panel de categorías del reproductor (TV en vivo) */
+.cat-panel{position:absolute;top:0;left:0;bottom:0;width:min(330px,82%);z-index:40;background:rgba(10,12,17,.94);
+  backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);border-right:1px solid rgba(255,255,255,.08);
+  display:flex;flex-direction:column;animation:catIn .22s ease}
+@keyframes catIn{from{transform:translateX(-26px);opacity:0}to{transform:none;opacity:1}}
+.cat-head{display:flex;align-items:center;justify-content:space-between;padding:14px 14px 10px 18px;font-weight:750;font-size:15px}
+.cat-body{flex:1;overflow-y:auto;padding:0 10px 16px}
+.cat-item{display:flex;align-items:center;gap:9px;width:100%;padding:10px 12px;border-radius:11px;font-size:13.5px;font-weight:600;text-align:left;color:var(--t-1);transition:background .15s}
+.cat-item small{margin-left:auto;color:var(--t-3);font-weight:600}
+.cat-item .live-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+.cat-item.cur{color:var(--accent)}
+.cat-item.cur .live-dot{box-shadow:0 0 0 3px rgba(10,132,255,.25)}
+.cat-back{color:var(--t-2)}
+/* Pista de atajos del reproductor */
+.pl-hints{position:absolute;left:50%;bottom:108px;transform:translateX(-50%);z-index:7;pointer-events:none;
+  font-size:11.5px;font-weight:600;letter-spacing:.2px;color:rgba(255,255,255,.62);background:rgba(8,10,14,.45);
+  border:1px solid rgba(255,255,255,.08);border-radius:999px;padding:7px 16px;white-space:nowrap;max-width:92%;
+  overflow:hidden;text-overflow:ellipsis;transition:opacity .3s}
+#player-root.hidecursor .pl-hints{opacity:0}
 </style>
 </head>
 <body>
@@ -570,6 +589,10 @@ main{max-width:1400px;margin:0 auto;padding:96px 28px 130px}
   <div class="rec-badge" id="pl-rec" hidden>
     <span class="rec-dot"></span><span id="pl-rec-time">00:00</span>
   </div>
+  <div class="cat-panel" id="pl-catpanel" hidden>
+    <div class="cat-head"><span>Categorías</span><button class="icon-btn" id="pl-catx" aria-label="Cerrar categorías (Esc)"></button></div>
+    <div class="cat-body" id="pl-catbody"></div>
+  </div>
   <div class="pl-error" id="pl-error" hidden></div>
   <div class="pl-controls" id="pl-controls">
     <div class="pl-seekrow">
@@ -578,7 +601,9 @@ main{max-width:1400px;margin:0 auto;padding:96px 28px 130px}
       <span class="pl-time" id="pl-time">00:00 / 00:00</span>
     </div>
     <div class="pl-btnrow">
+      <button class="pl-btn" id="pl-prev" data-focus aria-label="Anterior: canal o episodio" hidden></button>
       <button class="pl-btn" id="pl-play" data-focus aria-label="Reproducir o pausar (Espacio)"></button>
+      <button class="pl-btn" id="pl-next" data-focus aria-label="Siguiente: canal o episodio" hidden></button>
       <div class="vol-wrap">
         <button class="pl-btn" id="pl-mute" data-focus aria-label="Silenciar (M)"></button>
         <input id="pl-vol" type="range" min="0" max="100" value="100" data-focus aria-label="Volumen"/>
@@ -592,6 +617,7 @@ main{max-width:1400px;margin:0 auto;padding:96px 28px 130px}
     </div>
     <div class="menu" id="pl-menu" hidden></div>
   </div>
+  <div class="pl-hints" id="pl-hints"></div>
 </div>
 
 <!-- Hub flotante de progreso de descargas -->
@@ -753,6 +779,8 @@ const I = (name, size = 20, extra = '') =>
 const ICONS = {
   play: '<path d="M8 5.4v13.2c0 .8.9 1.3 1.6.9l10.5-6.6c.6-.4.6-1.4 0-1.8L9.6 4.5c-.7-.4-1.6.1-1.6.9z" fill="currentColor" stroke="none"/>',
   pause: '<rect x="6" y="5" width="4" height="14" rx="1.2" fill="currentColor" stroke="none"/><rect x="14" y="5" width="4" height="14" rx="1.2" fill="currentColor" stroke="none"/>',
+  prev: '<rect x="4" y="5" width="2.4" height="14" rx="1" fill="currentColor" stroke="none"/><path d="M19.5 6.2v11.6c0 .9-1 1.4-1.7.9l-8-5.8c-.6-.4-.6-1.3 0-1.8l8-5.8c.7-.5 1.7 0 1.7.9z" fill="currentColor" stroke="none"/>',
+  next: '<rect x="17.6" y="5" width="2.4" height="14" rx="1" fill="currentColor" stroke="none"/><path d="M4.5 6.2v11.6c0 .9 1 1.4 1.7.9l8-5.8c.6-.4.6-1.3 0-1.8l-8-5.8c-.7-.5-1.7 0-1.7.9z" fill="currentColor" stroke="none"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M16.5 16.5 21 21"/>',
   home: '<path d="M3.5 10.8 12 4l8.5 6.8"/><path d="M5.5 9.5V20h13V9.5"/><path d="M9.5 20v-6h5v6"/>',
   tv: '<rect x="2.5" y="4.5" width="19" height="13" rx="2.5"/><path d="M8.5 21h7"/>',
@@ -2875,7 +2903,7 @@ async function openSeriesModal(item) {
         ? (/^\d+$/.test(info.duration) ? Math.round(info.duration / 60) + ' min' : info.duration)
         : '';
       const row = el('div', { class: 'ep-row', 'data-focus': '', role: 'button', tabindex: '-1' });
-      const open = () => Player.openEpisode(item, sn.season, ep);
+      const open = () => Player.openEpisode(item, sn.season, ep, sn.episodes);
       row.addEventListener('click', open);
       row.append(
         el('div', { class: 'ep-num' }, 'T' + sn.season + '·E' + (ep.episode_num || '?')),
@@ -2944,7 +2972,8 @@ const Player = {
     const ids = ['player-root', 'pl-video', 'pl-back', 'pl-title', 'pl-sub', 'pl-epgmini',
       'pl-rec', 'pl-rec-time', 'pl-spin', 'pl-error', 'pl-controls', 'pl-livebadge',
       'pl-seek', 'pl-time', 'pl-play', 'pl-mute', 'pl-vol', 'pl-quality',
-      'pl-record', 'pl-download', 'pl-pip', 'pl-full', 'pl-menu'];
+      'pl-record', 'pl-download', 'pl-pip', 'pl-full', 'pl-menu',
+      'pl-prev', 'pl-next', 'pl-catpanel', 'pl-catbody', 'pl-catx', 'pl-hints'];
     ids.forEach(id => { const key = id === 'player-root' ? 'root' : id.replace('pl-', ''); this.el[key] = $('#' + id); });
     this.el.root = $('#player-root');        // alias estable
     this.el.recTime = $('#pl-rec-time');     // alias legible para el cronómetro PVR
@@ -2958,19 +2987,35 @@ const Player = {
     this.el.download.innerHTML = I('download', 20);
     this.el.pip.innerHTML = I('pip', 20);
     this.el.full.innerHTML = I('full', 20);
+    this.el.prev.innerHTML = I('prev', 20);
+    this.el.next.innerHTML = I('next', 20);
+    this.el.catx.innerHTML = I('x', 16);
 
     this.el.back.addEventListener('click', () => this.requestClose());
     this.el.play.addEventListener('click', () => this.togglePlay());
     this.el.mute.addEventListener('click', () => this.toggleMute());
     this.el.full.addEventListener('click', () => this.toggleFull());
+    this.el.prev.addEventListener('click', () => this.step(-1));
+    this.el.next.addEventListener('click', () => this.step(1));
+    this.el.catx.addEventListener('click', () => this.closeCats());
     if (this.el.pip && document.pictureInPictureEnabled)
       this.el.pip.addEventListener('click', () => this.togglePip());
     else this.el.pip.hidden = true;
 
     this.el.vol.addEventListener('input', e => this.setVolume(Number(e.target.value) / 100));
+    // Barra de progreso: mientras se arrastra solo se previsualiza; al soltar se salta.
+    // Así el timeupdate nunca pelea con el pulgar y el salto se hace una sola vez.
     this.el.seek.addEventListener('input', e => {
       if (this.isLive || !isFinite(this.video.duration)) return;
-      this.video.currentTime = (Number(e.target.value) / 1000) * this.video.duration;
+      this._scrubbing = true;
+      const t = (Number(e.target.value) / 1000) * this.video.duration;
+      this.el.time.textContent = fmtTime(Math.max(0, t)) + ' / ' + fmtTime(this.video.duration);
+      this.poke();
+    });
+    this.el.seek.addEventListener('change', e => {
+      this._scrubbing = false;
+      if (this.isLive || !isFinite(this.video.duration)) return;
+      this.video.currentTime = Math.max(0, (Number(e.target.value) / 1000) * this.video.duration);
       this.poke();
     });
     this.el.livebadge.addEventListener('click', () => this.goLiveEdge());
@@ -2981,10 +3026,16 @@ const Player = {
     v.addEventListener('playing', () => { this.spin(false); this.poke(); this.syncPlayIcon(); });
     v.addEventListener('pause', () => { this.poke(); this.syncPlayIcon(); });
     v.addEventListener('waiting', () => this.spin(true));
+    v.addEventListener('seeking', () => { if (!this._scrubbing) this.spin(true); });
+    v.addEventListener('seeked', () => this.spin(false));
+    v.addEventListener('canplay', () => clearTimeout(this._wdTimer));
     v.addEventListener('timeupdate', () => this.syncTime());
     v.addEventListener('volumechange', () => this.syncVolUI());
     v.addEventListener('error', () => {
-      if (this.isOpenFlag && v.error && this.el.error.hidden) this.plError();
+      if (this.isOpenFlag && v.error && this.el.error.hidden) {
+        const c = v.error.code;                       // 3=decodificación · 4=formato no soportado
+        this.plError(c === 3 || c === 4 ? 'format' : 'net');
+      }
     });
     document.addEventListener('fullscreenchange', () => {
       this.el.full.innerHTML = I(document.fullscreenElement ? 'x' : 'full', 20);
@@ -2999,8 +3050,11 @@ const Player = {
       this._open({ kind: 'demo', demoLabel: item.name, title: item.name, sub: 'Canal en vivo · Demo',
         isLive: true, canRecord: true, epgStreamId: String(item.stream_id), channelName: item.name });
     } else {
+      const list = Session.live.filter(x => String(x.category_id) === String(item.category_id));
+      const idx = Math.max(0, list.findIndex(x => String(x.stream_id) === String(item.stream_id)));
       this._open({ kind: 'live', url: Session.liveUrl(item), title: item.name, sub: 'Canal en vivo',
-        isLive: true, canRecord: true, epgStreamId: String(item.stream_id), channelName: item.name });
+        isLive: true, canRecord: true, epgStreamId: String(item.stream_id), channelName: item.name,
+        liveList: list, liveIdx: idx });
     }
   },
   openMovie(item) {
@@ -3016,7 +3070,7 @@ const Player = {
         downloadMime: mimeForExt(ext) });
     }
   },
-  openEpisode(seriesItem, season, ep) {
+  openEpisode(seriesItem, season, ep, episodes) {
     const url = Session.client ? Session.client.episodeUrl(ep.id, ep.container_extension || 'mp4') : null;
     if (!url) { Toast.err('La señal demo de series no incluye reproducción.'); return; }
     const ext = ep.container_extension || 'mp4';
@@ -3024,7 +3078,10 @@ const Player = {
       sub: 'T' + season + ' · E' + (ep.episode_num || '?') + (ep.title ? ' — ' + ep.title : ''),
       canDownload: true, downloadUrl: url,
       downloadName: safeName(seriesItem.name) + ' T' + season + 'E' + ep.episode_num + '.' + ext,
-      downloadMime: mimeForExt(ext) });
+      downloadMime: mimeForExt(ext),
+      epList: episodes || null,
+      epIdx: episodes ? episodes.findIndex(x => String(x.id) === String(ep.id)) : -1,
+      seriesItem: seriesItem, season: season });
   },
   openLocal(blobUrl, name) {
     this._open({ kind: 'local', url: blobUrl, title: name, sub: 'Reproducción local' });
@@ -3032,16 +3089,25 @@ const Player = {
 
   /* ---------- Apertura interna ---------- */
   _open(opts) {
+    const wasOpen = this.isOpenFlag;          // cambio de canal/episodio sin cerrar
     this._lastOpts = opts;
     this._retryCount = 0;
     this._proxyTried = false;
+    this._scrubbing = false;
     this._teardownMedia();
-    this._prevFocus = Focus.current;
+    if (!wasOpen) this._prevFocus = Focus.current;
     this.isOpenFlag = true;
     this.isLive = !!opts.isLive;
     this.canDownload = !!opts.canDownload;
     this.canRecord = !!opts.canRecord;
     this.localUrl = opts.kind === 'local' ? opts.url : null;
+    // Contexto para cambiar de canal (TV) o de episodio (series) con las teclas
+    this._liveCtx = opts.kind === 'live' && opts.liveList && opts.liveList.length
+      ? { list: opts.liveList, idx: Math.max(0, opts.liveIdx || 0) }
+      : null;
+    this._epCtx = opts.kind === 'episode' && opts.epList && opts.epIdx >= 0
+      ? { seriesItem: opts.seriesItem, season: opts.season, list: opts.epList, idx: opts.epIdx }
+      : null;
 
     const r = this.el.root;
     r.hidden = false;
@@ -3051,18 +3117,32 @@ const Player = {
     this.el.error.hidden = true;
     this.el.rec.hidden = true;
     this.closeMenu();
+    this.closeCats();
     this.el.record.hidden = !opts.canRecord;
     this.el.record.classList.remove('rec-on');
     this.el.download.hidden = !opts.canDownload;
     this.el.quality.hidden = true;
+    const stepable = opts.kind === 'live' || opts.kind === 'episode';   // canales y episodios
+    this.el.prev.hidden = !stepable;
+    this.el.next.hidden = !stepable;
+    this.el.hints.textContent = opts.isLive
+      ? '↑↓ canal · C categorías · R grabar · Q calidad · M silencio · Espacio pausa · F pantalla · Esc salir'
+      : opts.kind === 'episode'
+        ? '←→ 10 s · ↑↓ episodio · Q calidad · D descargar · M silencio · F pantalla · Esc salir'
+        : '←→ 10 s · Q calidad · D descargar · M silencio · F pantalla · Esc salir';
     this.el.livebadge.hidden = !opts.isLive;
     this.el.seek.hidden = !!opts.isLive;
     this.syncTime();
 
-    Focus.push(r);
+    if (!wasOpen) Focus.push(r);
     clearInterval(this._epgTimer);
     if (opts.epgStreamId) this._startEPG(opts.epgStreamId);
 
+    // Vigilante: si en 16 s la señal no entrega datos, avisa en vez de girar para siempre
+    clearTimeout(this._wdTimer);
+    this._wdTimer = setTimeout(() => {
+      if (this.isOpenFlag && this.video.readyState < 3 && this.el.error.hidden) this.plError('slow');
+    }, 16000);
     this.spin(true);
     this._setupSource(opts);
     if (S.get('autoplay')) this.video.play().catch(() => { this.spin(false); this.poke(); });
@@ -3148,6 +3228,7 @@ const Player = {
   },
 
   _teardownMedia() {
+    clearTimeout(this._wdTimer);
     if (this.hls) { try { this.hls.destroy(); } catch (_e) { /* noop */ } this.hls = null; }
     if (this.demoSrc) { this.demoSrc.stop(); this.demoSrc = null; }
     this.video.pause();
@@ -3190,6 +3271,10 @@ const Player = {
           : 'El navegador bloqueó la señal (CORS) o el servidor está caído. Prueba en <b>Ajustes → Red → Probar conexión</b> (proxy público, sin instalar nada), usa la <b>extensión CORS</b> del Asistente o publica la app en la nube (carpeta <code>publicar</code>).')],
       hls: ['Formato no soportado',
         'Tu navegador no soporta HLS ni de forma nativa ni vía Hls.js (¿sin conexión al CDN?). Prueba con Chrome, Edge o Safari actualizados.'],
+      format: ['Este vídeo no se puede reproducir en el navegador',
+        'El archivo llegó en un formato o códec que el navegador no decodifica (típico en MKV/AVI con HEVC, DTS o AC3, o en MPEG-TS). No es un fallo de tu red ni de la cuenta: prueba otro contenido, o descárgalo con la tecla <b>D</b> para verlo en un reproductor de escritorio.'],
+      slow: ['El servidor tarda demasiado en responder',
+        'La señal no entrega datos (se queda cargando). Suele ser saturación del servidor IPTV o un corte puntual. Reintenta, prueba otro contenido, o usa <b>D</b> para descargarlo y verlo con calma.'],
     };
     const [t, m] = msgs[kind] || msgs.net;
     e.innerHTML = '';
@@ -3275,6 +3360,7 @@ const Player = {
       this.el.time.textContent = 'Directo';
       return;
     }
+    if (this._scrubbing) return;      // el usuario está arrastrando la barra: no pelear con el pulgar
     const d = isFinite(v.duration) ? v.duration : 0;
     const p = d ? (v.currentTime / d) : 0;
     this.el.seek.value = Math.round(p * 1000);
@@ -3301,6 +3387,92 @@ const Player = {
     const o = this._lastOpts;
     if (!o || !o.downloadUrl) return;
     DL.add({ url: o.downloadUrl, name: o.downloadName || 'video.mp4', mime: o.downloadMime || 'video/mp4', kind: 'vod', accId: Accounts.activeId });
+    Toast.info('Cuando termine la ves en la sección «Descargas y Grabaciones».');
+  },
+
+  /* ---------- Cambio de canal (TV) y de episodio (series) ---------- */
+  step(dir) {
+    this.closeMenu();
+    this.poke();
+    if (this.isLive) this.channelStep(dir);
+    else if (this._lastOpts && this._lastOpts.kind === 'episode') this.episodeStep(dir);
+  },
+  channelStep(dir) {
+    const ctx = this._liveCtx;
+    if (!ctx || !ctx.list || !ctx.list.length) { Toast.info('El canal de demostración no tiene lista de canales.'); return; }
+    if (ctx.list.length < 2) { Toast.info('Solo hay un canal en esta categoría.'); return; }
+    if (PVR.active) PVR.stop().catch(() => { /* noop */ });
+    const idx = (ctx.idx + dir + ctx.list.length) % ctx.list.length;
+    this.playLiveItem(ctx.list[idx], idx);
+  },
+  playLiveItem(item, idx) {
+    const ctx = this._liveCtx;
+    this._open({ kind: 'live', url: Session.liveUrl(item), title: item.name, sub: 'Canal en vivo',
+      isLive: true, canRecord: true, epgStreamId: String(item.stream_id), channelName: item.name,
+      liveList: ctx.list, liveIdx: idx });
+    Toast.ok('Canal: ' + (item.name || ''));
+  },
+  episodeStep(dir) {
+    const ctx = this._epCtx;
+    if (!ctx || !ctx.list || ctx.list.length < 2) { Toast.info('No hay más episodios en esta temporada.'); return; }
+    if (PVR.active) PVR.stop().catch(() => { /* noop */ });
+    const idx = (ctx.idx + dir + ctx.list.length) % ctx.list.length;
+    const ep = ctx.list[idx];
+    this.openEpisode(ctx.seriesItem, ctx.season, ep, ctx.list);
+    Toast.ok('Episodio: T' + ctx.season + 'E' + (ep.episode_num || '?'));
+  },
+
+  /* ---------- Panel de categorías (TV en vivo, tecla C) ---------- */
+  openCats() {
+    if (!this._lastOpts || this._lastOpts.kind !== 'live') return;
+    if (!Session.ready || !Session.liveCats.length) { Toast.err('No hay categorías cargadas para esta cuenta.'); return; }
+    this._catLevel = 1;
+    this.el.catpanel.hidden = false;
+    this._catOpen = true;
+    this.renderCats();
+    Focus.push(this.el.catpanel);
+    requestAnimationFrame(() => Focus.focusFirst());
+    this.poke();
+  },
+  closeCats() {
+    if (!this._catOpen) return;
+    this._catOpen = false;
+    this.el.catpanel.hidden = true;
+    Focus.pop(this.el.catpanel);
+    this.poke();
+  },
+  renderCats() {
+    const body = this.el.catbody;
+    body.innerHTML = '';
+    const cur = this._liveCtx && this._liveCtx.list && this._liveCtx.list[this._liveCtx.idx];
+    const curCatId = cur ? String(cur.category_id) : '';
+    const curChId = cur ? String(cur.stream_id) : '';
+    if (this._catLevel === 1) {
+      for (const c of Session.liveCats) {
+        const n = Session.live.filter(x => String(x.category_id) === String(c.category_id)).length;
+        const b = el('button', { class: 'cat-item' + (String(c.category_id) === curCatId ? ' cur' : ''), 'data-focus': '' },
+          el('span', { class: 'live-dot' }), el('span', {}, c.category_name || 'Sin nombre'), el('small', {}, String(n)));
+        b.addEventListener('click', () => { this._catLevel = 2; this._catSel = c.category_id; this.renderCats(); requestAnimationFrame(() => Focus.focusFirst()); });
+        body.append(b);
+      }
+    } else {
+      const back = el('button', { class: 'cat-item cat-back', 'data-focus': '', html: I('back', 16) + '<span>Todas las categorías</span>' });
+      back.addEventListener('click', () => { this._catLevel = 1; this.renderCats(); requestAnimationFrame(() => Focus.focusFirst()); });
+      body.append(back);
+      const chans = Session.live.filter(x => String(x.category_id) === String(this._catSel));
+      for (const ch of chans) {
+        const b = el('button', { class: 'cat-item' + (String(ch.stream_id) === curChId ? ' cur' : ''), 'data-focus': '' },
+          el('span', { class: 'live-dot' }), el('span', {}, ch.name || 'Canal'));
+        b.addEventListener('click', () => {
+          const idx = Math.max(0, chans.findIndex(x => String(x.stream_id) === String(ch.stream_id)));
+          this.closeCats();
+          if (PVR.active) PVR.stop().catch(() => { /* noop */ });
+          this._liveCtx = { list: chans, idx };
+          this.playLiveItem(ch, idx);
+        });
+        body.append(b);
+      }
+    }
   },
 
   spin(on) { this.el.spin.hidden = !on; },
@@ -3331,6 +3503,7 @@ const Player = {
   close() {
     if (!this.isOpenFlag) return;
     this.isOpenFlag = false;
+    clearTimeout(this._wdTimer);
     if (PVR.active) PVR.stop().catch(() => {});
     clearInterval(this._epgTimer);
     clearTimeout(this._hideTimer);
@@ -3346,6 +3519,15 @@ const Player = {
   /* ---------- Teclado del reproductor ---------- */
   keydown(e) {
     const v = this.video;
+    // Panel de categorías abierto: navegación propia dentro del panel
+    if (this._catOpen) {
+      const k = e.key;
+      if (k === 'ArrowUp' || k === 'ArrowDown') { e.preventDefault(); Focus.move(0, k === 'ArrowDown' ? 1 : -1); this.poke(); }
+      else if (k === 'ArrowLeft' || k === 'ArrowRight') { e.preventDefault(); Focus.move(k === 'ArrowRight' ? 1 : -1, 0); this.poke(); }
+      else if (k === 'Enter') { e.preventDefault(); if (Focus.current) Focus.current.click(); }
+      else if (k === 'Escape' || k === 'c' || k === 'C') { e.preventDefault(); this.closeCats(); }
+      return;
+    }
     switch (e.key) {
       case 'Escape':
         e.preventDefault();
@@ -3359,13 +3541,32 @@ const Player = {
       case 'ArrowLeft':
         if (!this.isLive) { v.currentTime = Math.max(0, v.currentTime - 10); this.poke(); }
         break;
-      case 'ArrowUp': e.preventDefault(); this.setVolume(v.volume + .05); this.poke(); break;
-      case 'ArrowDown': e.preventDefault(); this.setVolume(v.volume - .05); this.poke(); break;
+      case 'ArrowUp':
+        e.preventDefault();
+        if (this.isLive) this.channelStep(1);                       // zapear hacia el canal anterior…
+        else if (this._lastOpts && this._lastOpts.kind === 'episode') this.episodeStep(1);
+        else this.setVolume(v.volume + .05);
+        this.poke(); break;
+      case 'ArrowDown':
+        e.preventDefault();
+        if (this.isLive) this.channelStep(-1);
+        else if (this._lastOpts && this._lastOpts.kind === 'episode') this.episodeStep(-1);
+        else this.setVolume(v.volume - .05);
+        this.poke(); break;
+      case '+': case '=': this.setVolume(v.volume + .05); this.poke(); break;
+      case '-': case '_': this.setVolume(v.volume - .05); this.poke(); break;
+      case 'c': case 'C':
+        if (this._lastOpts && this._lastOpts.kind === 'live') this.openCats();
+        else if (this.isLive) Toast.info('El canal de demostración no tiene lista de canales.');
+        break;
       case 'f': case 'F': this.toggleFull(); break;
       case 'm': case 'M': this.toggleMute(); break;
       case 'r': case 'R': if (this.canRecord) PVR.toggle(this); break;
       case 'd': case 'D': if (this.canDownload) this.download(); break;
-      case 'q': case 'Q': if (!this.el.quality.hidden) this.toggleMenu(); break;
+      case 'q': case 'Q':
+        if (!this.el.quality.hidden) this.toggleMenu();
+        else Toast.info('Este contenido ofrece una sola calidad: el servidor no envía alternativas.');
+        break;
     }
   },
 };
@@ -3792,8 +3993,8 @@ const PVR = {
     if (!this.supported()) { Toast.err('Este navegador no soporta MediaRecorder/captureStream.'); return; }
     const v = player.video;
     const stream = (v.captureStream && v.captureStream()) || (v.mozCaptureStream && v.mozCaptureStream());
-    if (!stream || !stream.getVideoTracks().length) {
-      Toast.err('No se puede capturar la señal: reproduce el canal antes de grabar.');
+    if (!stream || (!stream.getVideoTracks().length && !stream.getAudioTracks().length)) {
+      Toast.err('No se puede capturar la señal: deja que el vídeo se esté reproduciendo unos segundos e inténtalo de nuevo.');
       return;
     }
     const name = this._suggestedName(player);
@@ -3806,12 +4007,17 @@ const PVR = {
         handle = await window.showSaveFilePicker({ suggestedName: name });
         writer = await handle.createWritable();
       } catch (e) {
-        if (e && e.name === 'AbortError') { Toast.info('Grabación cancelada: no se eligió archivo de destino.'); return; }
+        if (e && e.name === 'AbortError') Toast.info('Sin archivo de destino: la grabación irá a la memoria y se guardará al detener.');
         writer = null; // sin acceso a disco → memoria
       }
     }
 
-    this.rec = new MediaRecorder(stream, { mimeType: this.mime, videoBitsPerSecond: 6_000_000 });
+    try {
+      this.rec = new MediaRecorder(stream, { mimeType: this.mime, videoBitsPerSecond: 6_000_000 });
+    } catch (err) {
+      Toast.err('No se pudo iniciar la grabación: ' + (err && err.message || err));
+      return;
+    }
     this.chunks = [];
     this.bytes = 0;
     this.writer = writer;
@@ -3867,7 +4073,11 @@ const PVR = {
     }
     await DB.put('downloads', record).catch(() => { /* noop */ });
     this.rec = null; this.writer = null; this.handle = null; this.chunks = [];
-    Toast.ok('Grabación guardada en Descargas y Grabaciones');
+    if (!this.bytes) {
+      Toast.err('La grabación quedó vacía: la señal se reproduce en directo (sin proxy) y el navegador la bloquea para capturar. Activa el proxy propio en Ajustes → Red y repite.', 6500);
+    } else {
+      Toast.ok('Grabación guardada en Descargas y Grabaciones');
+    }
     emit('dl:records');
     return record;
   },
@@ -4156,7 +4366,9 @@ function renderSettingsView() {
     el('div', { class: 'sub' }, 'Navegación completa sin ratón, estilo mando Apple TV.'),
     setRow('Flechas / Enter / Esc', 'Mover el foco · abrir · volver.', el('span', { class: 'tag disk' }, 'D-PAD')),
     setRow('Ctrl + K  ·  /', 'Abrir el buscador global.', el('span', { class: 'tag disk' }, 'BUSCAR')),
-    setRow('Espacio · F · M', 'Play/Pausa · Pantalla completa · Silencio (reproductor).', el('span', { class: 'tag disk' }, 'PLAYER')),
+    setRow('Espacio · F · M · +/−', 'Play/Pausa · Pantalla completa · Silencio · Volumen (reproductor).', el('span', { class: 'tag disk' }, 'PLAYER')),
+    setRow('↑ · ↓', 'TV en vivo: canal siguiente/anterior. Series: episodio siguiente/anterior.', el('span', { class: 'tag disk' }, 'ZAP')),
+    setRow('C', 'Categorías de TV en un panel a la izquierda (dentro del reproductor).', el('span', { class: 'tag disk' }, 'TV')),
     setRow('R · D · Q', 'Grabar · Descargar · Calidad (reproductor).', el('span', { class: 'tag rec' }, 'PVR'))));
 
   v.append(g);
@@ -4257,7 +4469,7 @@ function globalKeys(e) {
 
   window.__DJ_READY__ = true;   // desactiva el aviso de compatibilidad
   const style = 'color:#0A84FF;font-weight:bold;font-size:14px';
-  console.log('%c DJ-IPTV v1.2 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
+  console.log('%c DJ-IPTV v1.3 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
 })();
 </script>
 </body>
