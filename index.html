@@ -7,8 +7,10 @@
 <meta name="description" content="DJ-IPTV · Cliente IPTV web personal estilo Apple tvOS · Xtream Codes"/>
 <title>DJ-IPTV</title>
 <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="%230A84FF"/><text x="32" y="42" font-family="Arial" font-size="26" font-weight="bold" fill="white" text-anchor="middle">DJ</text></svg>'/>
-<!-- Motor HLS: Hls.js con fallback nativo en Safari (canPlayType) -->
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js" defer onerror="window.__hlsCdFail=true"></script>
+<!-- Motor HLS: Hls.js con fallback nativo en Safari (canPlayType). Si el CDN falla o está
+     bloqueado, prueba la copia local hls.min.js incluida junto a este archivo. -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js" defer
+  onerror="var s=document.createElement('script');s.src='hls.min.js';s.defer=true;s.onerror=function(){window.__hlsCdFail=true};document.head.appendChild(s);"></script>
 <style>
 /* ============================================================
    DJ-IPTV · Sistema de diseño estilo Apple tvOS (Liquid Glass)
@@ -1055,8 +1057,22 @@ const Net = {
     const p = (S.get('proxyBase') || '').replace(/\/+$/, '');
     if (!p) return url;
     const route = S.get('proxyRoute') || '/proxy';
+    const prefix = p + route + '?url=';
+    if (String(url).indexOf(prefix) === 0) return url;   // ya envuelta: no duplicar el proxy
     try { if (new URL(url, location.href).origin === location.origin) return url; } catch (_e) { /* url relativa */ }
     return p + route + '?url=' + encodeURIComponent(url);
+  },
+  /** Recupera la URL original de una que ya pasó por el proxy propio. */
+  unwrap(url) {
+    const u = String(url || '');
+    const p = (S.get('proxyBase') || '').replace(/\/+$/, '');
+    if (p) {
+      const prefix = p + (S.get('proxyRoute') || '/proxy') + '?url=';
+      if (u.indexOf(prefix) === 0) {
+        try { return decodeURIComponent(u.slice(prefix.length)) || u; } catch (_e) { /* plantilla rara */ }
+      }
+    }
+    return u;
   },
   isProxied() { return !!(S.get('proxyBase') || '').trim(); },
 
@@ -1100,17 +1116,50 @@ const Net = {
     if (this.publicOn() && S.get('corsMode') !== 'off') return this.wrapOnce(url);
     return url;
   },
-  /** Clase loader de hls.js que envuelve TODAS las peticiones (manifiesto, niveles, segmentos, claves). */
+  /** Clase loader de hls.js que envuelve TODAS las peticiones (manifiesto, niveles, segmentos, claves)
+   *  y REESCRIBE los manifiestos: los servidores Xtream suelen devolver rutas de segmento
+   *  RELATIVAS, que hls.js resolvería contra la URL del proxy (404). Aquí cada URI del m3u8
+   *  se convierte en absoluta contra el servidor original y se envuelve por el proxy. */
   hlsProxyLoader(wrapFn) {
     const Base = window.Hls && window.Hls.DefaultConfig && window.Hls.DefaultConfig.loader;
     if (!Base) return null;
     const self = this;
     const wrap = wrapFn || (u => self.wrapOnce(u));
+    const rewriteM3U = (text, base) => {
+      if (!text || text.indexOf('#EXTM3U') < 0) return text;
+      const abs = u => {
+        u = String(u || '').trim();
+        if (!u || /^(data:|blob:)/i.test(u)) return u;
+        try { return wrap(new URL(u, base).href) || u; } catch (_e) { return u; }
+      };
+      return text.split(/\r?\n/).map(ln => {
+        if (!ln) return ln;
+        if (ln.charAt(0) === '#') return ln.replace(/URI="([^"]*)"/g, (m2, u) => 'URI="' + abs(u) + '"');
+        return abs(ln);
+      }).join('\n');
+    };
     return class ProxyLoader extends Base {
       load(context, config, callbacks) {
         try {
           const u = String(context.url || '');
-          if (u) context.url = wrap(u) || u;
+          if (!u) { super.load(context, config, callbacks); return; }
+          const isPlaylist = context.type === 'manifest' || context.type === 'level';
+          if (isPlaylist && !callbacks.__djrw) {
+            callbacks.__djrw = true;
+            const base = self.unwrap(u);          // URL original en el servidor IPTV
+            const origOk = callbacks.onSuccess;
+            callbacks.onSuccess = (resp, stats, ctx2, net) => {
+              try {
+                const txt = typeof resp.data === 'string' ? resp.data : '';
+                if (txt.indexOf('#EXTM3U') >= 0) {
+                  resp.data = rewriteM3U(txt, base);
+                  resp.url = base;                // futuras resoluciones usan el servidor real
+                }
+              } catch (_e) { /* deja el texto tal cual */ }
+              return origOk(resp, stats, ctx2, net);
+            };
+          }
+          context.url = wrap(u) || u;
         } catch (_e) { /* deja la URL tal cual */ }
         super.load(context, config, callbacks);
       }
@@ -2635,6 +2684,28 @@ browseViewDef('live', 'live', 'Canales en Vivo', 'tv');
 browseViewDef('vod', 'movies', 'Películas', 'film');
 browseViewDef('series', 'series', 'Series', 'stack');
 
+/* ---------- Rueda del ratón: desplaza en horizontal carriles, chips y pestañas ----------
+   Pasa el ratón por una fila y usa la rueda: se mueve a izquierda/derecha.
+   En los extremos deja pasar el desplazamiento vertical de la página. */
+document.addEventListener('wheel', (e) => {
+  const t = e.target && e.target.closest ? e.target.closest('.rail-track, .chips, .tabs') : null;
+  if (!t) return;
+  let dy = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : 0;
+  if (!dy) return;
+  if (e.deltaMode === 1) dy *= 33;                    // Firefox: líneas → píxeles
+  if (t.scrollWidth <= t.clientWidth + 4) return;     // nada que desplazar
+  const max = t.scrollWidth - t.clientWidth;
+  // Objetivo acumulativo: girar rápido suma (el scroll suave del CSS es asíncrono)
+  if (t.__djX === undefined) t.__djX = t.scrollLeft;
+  const tgt = Math.max(0, Math.min(max, t.__djX + dy));
+  t.__djX = tgt;
+  t.scrollLeft = tgt;
+  clearTimeout(t.__djT);
+  t.__djT = setTimeout(() => { t.__djX = undefined; }, 200);
+  if ((tgt <= 0 && dy < 0) || (tgt >= max - 1 && dy > 0)) return;   // al borde: la página sigue
+  e.preventDefault();
+}, { passive: false });
+
 /** Renderiza una rejilla por bloques con IntersectionObserver. */
 function paginateGrid(grid, items, cardFn, chunk = 60) {
   if (!items.length) {
@@ -3309,6 +3380,8 @@ const Player = {
 const DL = {
   items: new Map(),
   MAX: 3,
+  PAR: 4,                     // conexiones simultáneas por archivo (modo rápido)
+  SLICE: 8 * 1024 * 1024,     // tamaño de trozo para descarga paralela (8 MB)
   _running: 0,
   _queue: [],
 
@@ -3341,44 +3414,28 @@ const DL = {
     this._ui();
     try {
       await this._openSink(it);
-      const headers = {};
-      if (it.received > 0) headers.Range = 'bytes=' + it.received + '-';
-      const r = await fetch(Net.downloadUrl(it.url), { headers, signal: it.ctl.signal, cache: 'no-store' });
-      if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status);
-      // El servidor ignora Range → reinicia limpio
-      if (it.received > 0 && r.status === 200) {
-        it.received = 0;
-        if (it.chunks) it.chunks.length = 0;
-        if (it.writer) { try { await it.writer.close(); } catch (_e) { /* noop */ } it.writer = await it.handle.createWritable(); }
-      }
-      if (r.status === 206 && r.headers.get('content-range')) {
-        const m = /\/(\d+)\s*$/.exec(r.headers.get('content-range'));
-        it.total = m ? Number(m[1]) : 0;
-      } else {
-        it.total = it.received + Number(r.headers.get('content-length') || 0);
-      }
-      const reader = r.body.getReader();
-      let lastT = performance.now(), lastB = it.received;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (it.writer) await it.writer.write(value);
-        else it.chunks.push(value);
-        it.received += value.byteLength;
-        const now = performance.now();
-        if (now - lastT > 800) {
-          it.speed = (it.received - lastB) * 1000 / (now - lastT);
-          lastT = now; lastB = it.received;
-          this._persist(it);
-          this._ui();
+      // Sonda Range: ¿el servidor (vía proxy) acepta trozos? → descarga paralela
+      let rangeOK = false, total = 0;
+      try {
+        const pr = await fetch(Net.downloadUrl(it.url), { headers: { Range: 'bytes=0-0' }, signal: it.ctl.signal, cache: 'no-store' });
+        if (pr.status === 206) {
+          rangeOK = true;
+          const m = /\/(\d+)\s*$/.exec(pr.headers.get('content-range') || '');
+          total = m ? Number(m[1]) : 0;
+        } else {
+          total = Number(pr.headers.get('content-length') || 0);
         }
-      }
+        try { if (pr.body) await pr.body.cancel(); } catch (_e) { /* noop */ }
+      } catch (_e) { /* sin sonda: sigue el camino simple */ }
+      if (total) it.total = total;
+      if (rangeOK && it.writer && total > this.SLICE) await this._runParallel(it, total);
+      else await this._runSimple(it);
       await this._finish(it);
     } catch (e) {
       if (e && e.name === 'AbortError') {
+        this._persist(it);            // guarda el progreso final mientras sigue «active»
         it.state = 'paused';
         if (it.writer) { try { await it.writer.close(); } catch (_e) { /* noop */ } it.writer = null; }
-        this._persist(it);
         Toast.info('Descarga en pausa: ' + it.name);
       } else {
         it.state = 'error';
@@ -3390,6 +3447,123 @@ const DL = {
       this._ui();
       this._pump();
     }
+  },
+
+  /** Camino clásico: un solo flujo secuencial (memoria o disco, con reanudación). */
+  async _runSimple(it) {
+    const headers = {};
+    if (it.received > 0) headers.Range = 'bytes=' + it.received + '-';
+    const r = await fetch(Net.downloadUrl(it.url), { headers, signal: it.ctl.signal, cache: 'no-store' });
+    if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status);
+    // El servidor ignora Range → reinicia limpio
+    if (it.received > 0 && r.status === 200) {
+      it.received = 0;
+      if (it.chunks) it.chunks.length = 0;
+      if (it.writer) { try { await it.writer.close(); } catch (_e) { /* noop */ } it.writer = await it.handle.createWritable(); }
+    }
+    if (r.status === 206 && r.headers.get('content-range')) {
+      const m = /\/(\d+)\s*$/.exec(r.headers.get('content-range'));
+      it.total = m ? Number(m[1]) : 0;
+    } else {
+      it.total = it.received + Number(r.headers.get('content-length') || 0);
+    }
+    const reader = r.body.getReader();
+    let lastT = performance.now(), lastB = it.received;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (it.writer) await it.writer.write(value);
+      else it.chunks.push(value);
+      it.received += value.byteLength;
+      const now = performance.now();
+      if (now - lastT > 800) {
+        it.speed = (it.received - lastB) * 1000 / (now - lastT);
+        lastT = now; lastB = it.received;
+        this._persist(it);
+        this._ui();
+      }
+    }
+  },
+
+  /** Modo rápido: N conexiones, cada una con un trozo Range del archivo.
+   *  Solo con destino en disco (writer); multiplica la velocidad a través del proxy. */
+  async _runParallel(it, total) {
+    if (!Array.isArray(it.parts) || !it.parts.length) {
+      it.parts = [];
+      for (let off = 0; off < total; off += this.SLICE) {
+        it.parts.push({ off: off, end: Math.min(off + this.SLICE, total) - 1, done: false, got: 0 });
+      }
+      it.received = 0;
+    } else {
+      it.received = it.parts.reduce((s, p) => s + (p.done ? p.end - p.off + 1 : 0), 0);
+    }
+    const pending = it.parts.filter(p => !p.done);
+    if (!pending.length) return;
+    const lock = { q: Promise.resolve() };
+    const workers = [];
+    let next = 0, failed = null;
+    const stopAll = () => { for (const w of workers) w.ctl.abort(); };
+    it.ctl.signal.addEventListener('abort', stopAll);
+    for (let w = 0; w < this.PAR && next < pending.length; w++) {
+      const ctl = new AbortController();
+      const job = (async () => {
+        while (next < pending.length && !failed) {
+          const part = pending[next++];
+          try {
+            part.got = part.got || 0;
+            const r = await fetch(Net.downloadUrl(it.url), {
+              headers: { Range: 'bytes=' + part.off + '-' + part.end },
+              signal: ctl.signal, cache: 'no-store',
+            });
+            if (r.status !== 206) throw new Error('HTTP ' + r.status);
+            const reader = r.body.getReader();
+            let cursor = part.off;
+            while (true) {
+              const rd = await reader.read();
+              if (rd.done) break;
+              const chunk = rd.value;
+              const len = chunk.byteLength;
+              lock.q = lock.q.then(async () => {
+                await it.writer.seek(cursor);
+                await it.writer.write(chunk);
+              }).catch(e2 => { failed = failed || e2; throw e2; });
+              cursor += len;
+              part.got += len;
+              it.received += len;
+            }
+            await lock.q;
+            part.done = true;
+            part.got = part.end - part.off + 1;
+          } catch (e) {
+            if (e && e.name === 'AbortError') {
+              try { await lock.q; } catch (_e2) { /* noop */ }
+              return;                       // pausa intencionada
+            }
+            failed = failed || e;
+            stopAll();
+            return;
+          }
+        }
+      })();
+      workers.push({ ctl: ctl, p: job });
+    }
+    let lastT = performance.now(), lastB = it.received;
+    const spdT = setInterval(() => {
+      const now = performance.now();
+      it.speed = Math.max(0, (it.received - lastB) * 1000 / (now - lastT));
+      lastT = now; lastB = it.received;
+      this._persist(it);
+      this._ui();
+    }, 800);
+    try {
+      await Promise.all(workers.map(w => w.p));
+    } finally {
+      clearInterval(spdT);
+      it.ctl.signal.removeEventListener('abort', stopAll);
+    }
+    if (it.ctl.signal.aborted) { const e = new Error('pausa'); e.name = 'AbortError'; throw e; }
+    if (failed) throw failed;
+    it.received = total;
   },
 
   /** Abre el destino: File System Access (disco) o bloques en IndexedDB. */
@@ -3447,7 +3621,11 @@ const DL = {
       id: it.id, name: it.name, kind: it.kind, mime: it.mime, state: 'paused',
       received: it.received, total: it.total, created: it.created, accountId: it.accId, url: it.url,
     };
-    if (it.writer) { base.hasHandle = true; base.handle = it.handle; }
+    if (it.writer) {
+      base.hasHandle = true;
+      base.handle = it.handle;
+      if (it.parts) base.parts = it.parts.map(p => ({ off: p.off, end: p.end, done: p.done }));
+    }
     else { base.chunks = it.chunks.slice(); }
     DB.put('downloads', base).catch(() => { /* cuota llena */ });
   },
@@ -3466,7 +3644,7 @@ const DL = {
         id, url: rec.url, name: rec.name, mime: rec.mime, kind: rec.kind, accId: rec.accountId,
         useFS: false, state: 'queued', received: rec.received || 0, total: rec.total || 0, speed: 0,
         created: rec.created || Date.now(), ctl: new AbortController(),
-        handle: rec.handle || null, writer: null, chunks: rec.chunks || [],
+        handle: rec.handle || null, writer: null, chunks: rec.chunks || [], parts: rec.parts || null,
       };
       this.items.set(id, it);
     } else if (it.state === 'paused' || it.state === 'error') {
