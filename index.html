@@ -531,6 +531,12 @@ main{max-width:1400px;margin:0 auto;padding:96px 28px 130px}
   border:1px solid rgba(255,255,255,.08);border-radius:999px;padding:7px 16px;white-space:nowrap;max-width:92%;
   overflow:hidden;text-overflow:ellipsis;transition:opacity .3s}
 #player-root.hidecursor .pl-hints{opacity:0}
+/* Pista del mando de TV (inicio) */
+.kbd-hint{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:7px;margin:28px auto 36px;max-width:880px;
+  font-size:12px;font-weight:600;color:var(--t-3);letter-spacing:.2px;text-align:center;padding:0 18px}
+.kbd-hint b{display:inline-block;padding:2px 9px;border-radius:7px;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.1);color:var(--t-2);font-weight:750;font-size:11px}
+.kbd-hint .sep{font-style:normal;opacity:.55}
 </style>
 </head>
 <body>
@@ -2829,6 +2835,16 @@ function renderDashboard() {
     v.append(el('div', { class: 'empty' },
       el('div', { class: 'big' }, 'El catálogo está vacío'),
       el('p', {}, 'Tu servidor no devolvió contenido. Prueba a refrescar la sesión desde Ajustes o cambia de cuenta.')));
+
+  // Pista del mando de TV (visible solo cuando hay contenido)
+  if (vod.length || series.length || live.length) {
+    v.append(el('div', { class: 'kbd-hint' },
+      el('b', {}, 'W·A·S·D'), ' mover', el('i', { class: 'sep' }, '·'),
+      el('b', {}, 'T'), ' abrir', el('i', { class: 'sep' }, '·'),
+      el('b', {}, 'L'), ' favorito', el('i', { class: 'sep' }, '·'),
+      el('b', {}, 'Esc'), ' volver', el('i', { class: 'sep' }, '·'),
+      el('b', {}, '/'), ' buscar'));
+  }
 }
 
 /* ---------- Vistas de navegación con categorías ---------- */
@@ -3722,7 +3738,8 @@ const Player = {
     const ctx = this._liveCtx;
     this._open({ kind: 'live', url: Session.liveUrl(item), title: item.name, sub: 'Canal en vivo',
       isLive: true, canRecord: true, epgStreamId: String(item.stream_id), channelName: item.name,
-      liveList: ctx.list, liveIdx: idx });
+      liveList: ctx.list, liveIdx: idx,
+      fav: { type: 'live', id: Favs.idOf('live', item), name: item.name } });
     Toast.ok('Canal: ' + (item.name || ''));
   },
   episodeStep(dir) {
@@ -3841,7 +3858,7 @@ const Player = {
       const left = k === 'ArrowLeft' || k === 'a' || k === 'A';
       if (up || down) { e.preventDefault(); Focus.move(0, down ? 1 : -1); this.poke(); }
       else if (left || right) { e.preventDefault(); Focus.move(right ? 1 : -1, 0); this.poke(); }
-      else if (k === 'Enter') { e.preventDefault(); if (Focus.current) Focus.current.click(); }
+      else if (k === 'Enter' || k === 't' || k === 'T') { e.preventDefault(); if (Focus.current) Focus.current.click(); }   // T = OK del mando
       else if (k === 'Escape' || k === 'c' || k === 'C') { e.preventDefault(); this.closeCats(); }
       return;
     }
@@ -3884,7 +3901,7 @@ const Player = {
         e.preventDefault();
         if (this.menuOpen) this.closeMenu(); else this.requestClose();
         break;
-      case ' ': case 'k': case 'K':
+      case ' ': case 'k': case 'K': case 't': case 'T':   // T = OK del mando → play/pausa
         e.preventDefault(); this.togglePlay(); break;
       case '+': case '=': this.setVolume(v.volume + .05); this.poke(); break;
       case '-': case '_': this.setVolume(v.volume - .05); this.poke(); break;
@@ -4714,7 +4731,8 @@ function renderSettingsView() {
   g.append(el('div', { class: 'set-card' },
     el('h3', { html: I('grid', 18) + '<span>Atajos de teclado</span>' }),
     el('div', { class: 'sub' }, 'Navegación completa sin ratón, estilo mando Apple TV.'),
-    setRow('Flechas / WASD / Enter / Esc', 'Mover el foco (flechas o WASD) · abrir · volver.', el('span', { class: 'tag disk' }, 'D-PAD')),
+    setRow('Flechas / WASD', 'Mover el foco entre tarjetas, chips y menús (igual que el mando de la tele).', el('span', { class: 'tag disk' }, 'MOVER')),
+    setRow('T  ·  Enter', 'Abrir o seleccionar lo enfocado (T = OK del mando). Esc vuelve atrás.', el('span', { class: 'tag disk' }, 'OK')),
     setRow('Ctrl + K  ·  /', 'Abrir el buscador global.', el('span', { class: 'tag disk' }, 'BUSCAR')),
     setRow('Espacio · F · M · +/−', 'Play/Pausa · Pantalla completa · Silencio · Volumen (reproductor).', el('span', { class: 'tag disk' }, 'PLAYER')),
     setRow('L', 'Añadir o quitar de FAVORITOS: estrella de la tarjeta enfocada o contenido en reproducción.', el('span', { class: 'tag disk' }, 'FAV')),
@@ -4730,10 +4748,12 @@ function globalKeys(e) {
   // 1 · Reproductor abierto: control total
   if (Player.isOpen()) { Player.keydown(e); return; }
 
-  // 2 · Buscador flotante
+  // 2 · Buscador flotante (T solo selecciona si no estás escribiendo; Enter siempre acepta)
   if (SearchOverlay.isOpen()) {
+    const stg = e.target && e.target.tagName ? e.target.tagName.toLowerCase() : '';
+    const typingS = stg === 'input' || stg === 'textarea';
     if (e.key === 'Escape') { e.preventDefault(); SearchOverlay.close(); }
-    else if (e.key === 'Enter') { e.preventDefault(); SearchOverlay.openFirst(); }
+    else if (e.key === 'Enter' || (!typingS && (e.key === 't' || e.key === 'T'))) { e.preventDefault(); SearchOverlay.openFirst(); }
     return;
   }
 
@@ -4752,14 +4772,14 @@ function globalKeys(e) {
 
   const t = e.target;
   const tag = (t.tagName || '').toLowerCase();
-  const typing = (tag === 'input' && ['text', 'password', 'search', 'number', 'email'].includes(t.type)) || tag === 'textarea';
+  const typing = (tag === 'input' && ['text', 'password', 'search', 'number', 'email'].includes(t.type)) || tag === 'textarea' || tag === 'select';
   if (typing) return;
 
   // 5 · Focus engine (D-Pad espacial · también WASD)
   const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
     a: [-1, 0], d: [1, 0], w: [0, -1], s: [0, 1], A: [-1, 0], D: [1, 0], W: [0, -1], S: [0, 1] };
   if (dirs[e.key]) { e.preventDefault(); Focus.move(dirs[e.key][0], dirs[e.key][1]); }
-  else if (e.key === 'Enter' && Focus.current) { e.preventDefault(); Focus.current.click(); }
+  else if ((e.key === 'Enter' || e.key === 't' || e.key === 'T') && Focus.current) { e.preventDefault(); Focus.current.click(); }   // T = OK del mando
   else if (e.key === 'l' || e.key === 'L') {          // favorito de la tarjeta enfocada (si tiene estrella)
     const b = Focus.current && Focus.current.querySelector ? Focus.current.querySelector('.fav-btn') : null;
     if (b) { e.preventDefault(); b.click(); }
@@ -4825,7 +4845,7 @@ function globalKeys(e) {
 
   window.__DJ_READY__ = true;   // desactiva el aviso de compatibilidad
   const style = 'color:#0A84FF;font-weight:bold;font-size:14px';
-  console.log('%c DJ-IPTV v1.3 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
+  console.log('%c DJ-IPTV v1.4 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
 })();
 </script>
 </body>
