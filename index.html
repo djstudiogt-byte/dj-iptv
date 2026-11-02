@@ -812,6 +812,7 @@ const ICONS = {
   volX: '<path d="M4 9.5v5h3.2L12 19V5L7.2 9.5H4z" fill="currentColor" stroke="none"/><path d="m16 9.5 5 5M21 9.5l-5 5"/>',
   full: '<path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>',
   pip: '<rect x="2.5" y="4.5" width="19" height="14" rx="2.5"/><rect x="12" y="11" width="7.5" height="5.5" rx="1.2" fill="currentColor" stroke="none"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
   trash: '<path d="M4.5 6.5h15M9.5 6.5V4.8c0-.7.6-1.3 1.3-1.3h2.4c.7 0 1.3.6 1.3 1.3v1.7M6.5 6.5 7.4 20a1.6 1.6 0 0 0 1.6 1.5h6a1.6 1.6 0 0 0 1.6-1.5l.9-13.5"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
@@ -1345,8 +1346,9 @@ const Net = {
       throw e;
     } finally { clearTimeout(t); }
   },
-  /** Un intento fetch→texto (listas M3U). Mismo control de errores que _once. */
-  async _onceText(finalUrl, timeout) {
+  /** Un intento fetch→texto con PROGRESO (listas M3U de hasta decenas de MB).
+   *  Mismo control de errores que _once; onBytes(recibidos, total) si se puede medir. */
+  async _onceText(finalUrl, timeout, onBytes) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), timeout);
     try {
@@ -1356,7 +1358,21 @@ const Net = {
         err.__status = r.status;
         throw err;
       }
-      return await r.text();
+      if (!onBytes || !r.body || !r.body.getReader) return await r.text();
+      const total = Number(r.headers.get('content-length')) || 0;
+      const reader = r.body.getReader();
+      const chunks = [];
+      let recv = 0;
+      for (;;) {
+        const rd = await reader.read();
+        if (rd.done) break;
+        chunks.push(rd.value);
+        recv += rd.value.byteLength;
+        try { onBytes(recv, total); } catch (_e) { /* el progreso no debe cortar nada */ }
+      }
+      const blob = new Blob(chunks);
+      try { return await blob.text(); }
+      catch (_e2) { return new TextDecoder('utf-8').decode(await blob.arrayBuffer()); }
     } catch (e) {
       if (e && e.name === 'AbortError') {
         const err = new Error('El servidor tardó demasiado en responder');
@@ -1371,40 +1387,46 @@ const Net = {
       throw e;
     } finally { clearTimeout(t); }
   },
-  /** fetch TEXTO con reserva: directo → proxies públicos (o micro-proxy propio).
-   *  Igual que json() pero devuelve el cuerpo tal cual (para listas M3U grandes). */
-  async text(url, timeout = 15000, onStep) {
+  /** fetch TEXTO con cadena de reserva completa: proxy propio → proxy público →
+   *  directo → resto de proxies públicos. A diferencia de json(), aquí cada ruta
+   *  se intenta aunque la anterior devolviera un HTTP de error: muchos paneles
+   *  IPTV devuelven 403 a las IPs de la nube (Cloudflare) pero sirven bien al
+   *  navegador del usuario, y las listas M3U son demasiado grandes para los
+   *  proxies públicos, así que conviene intentarlo todo. */
+  async text(url, timeout = 15000, onStep, onBytes) {
     const mode = S.get('corsMode') || 'auto';
-    if (this.isProxied()) {
-      const d = await this._onceText(this.proxied(url), timeout);
-      this.lastVia = 'local'; return d;
-    }
-    if (mode === 'always' && this.publicOn()) {
-      const d = await this._onceText(this.publicWrap(url), Math.max(timeout, 20000));
-      this.lastVia = 'public'; return d;
-    }
-    if (mode === 'off') {
-      const d = await this._onceText(url, timeout);
-      this.lastVia = 'direct'; return d;
-    }
-    try {
-      if (onStep) onStep('conexión directa…');
-      const d = await this._onceText(url, timeout);
-      this.lastVia = 'direct'; return d;
-    } catch (e) {
-      if (!this._isNetErr(e)) throw e;
-      const tpls = this.chain();
-      let last = e;
-      for (let i = 0; i < tpls.length; i++) {
-        if (onStep) onStep('proxy público ' + (i + 1) + '/' + tpls.length + '…');
-        try {
-          const d = await this._onceText(this.applyTpl(tpls[i], url), Math.max(timeout, 20000));
-          if (S.get('corsTpl') !== tpls[i]) S.set('corsTpl', tpls[i]);
-          this.lastVia = 'public'; return d;
-        } catch (e2) { last = e2; }
+    const routes = [];
+    if (this.isProxied()) routes.push({ via: 'local', build: u => this.proxied(u), step: 'conexión por el proxy…' });
+    if (mode === 'always' && this.publicOn()) routes.push({ via: 'public', build: u => this.publicWrap(u), to: Math.max(timeout, 30000), step: 'conexión por proxy público…' });
+    if (mode !== 'off') {
+      routes.push({ via: 'direct', build: u => u, step: 'conexión directa…' });
+      if (mode !== 'always') {
+        const tpls = this.chain();
+        for (let i = 0; i < tpls.length; i++) {
+          const tpl = tpls[i];
+          routes.push({ via: 'public', build: u => this.applyTpl(tpl, u), tpl: tpl, to: Math.max(timeout, 30000), step: 'proxy público ' + (i + 1) + '/' + tpls.length + '…' });
+        }
       }
-      throw this._blockErr(last);
+    } else {
+      routes.push({ via: 'direct', build: u => u, step: 'conexión directa…' });
     }
+    let firstErr = null;
+    for (let i = 0; i < routes.length; i++) {
+      const r = routes[i];
+      try {
+        if (onStep) onStep(r.step || 'conectando…');
+        const d = await this._onceText(r.build(url), r.to || timeout, onBytes);
+        this.lastVia = r.via;
+        if (r.tpl && S.get('corsTpl') !== r.tpl) S.set('corsTpl', r.tpl);
+        return d;
+      } catch (e) {
+        if (!firstErr) firstErr = e;
+        if (e && e.__timeout) throw e;          // sin tiempo en esta ruta: no insistir
+        continue;                                // 403/5xx/red: prueba la siguiente ruta
+      }
+    }
+    if (firstErr && firstErr.__status) throw firstErr;   // el HTTP de la 1ª ruta dice más que un «bloqueado» genérico
+    throw this._blockErr(firstErr);
   },
   /** fetch JSON con reserva: directo → proxies públicos (o micro-proxy propio). */
   async json(url, timeout = 15000, onStep) {
@@ -1473,8 +1495,10 @@ const Net = {
     if (/Sin conexión|Failed to fetch|NetworkError|CORS|Load failed|bloqueó/i.test(m))
       return 'El navegador bloqueó la conexión directa (CORS). DJ-IPTV ya reintentó solo a través de proxies públicos y no hubo manera. Prueba otra vez en unos segundos, cambia de proxy en Ajustes → Red, o pulsa «Asistente de conexión» (extensión CORS, enlace en la nube o servidor local).';
     if (/tardó demasiado/i.test(m))
-      return 'El servidor no respondió a tiempo (caído o saturado). Reintenta; si persiste, revisa host y puerto con tu proveedor.';
-    if (/HTTP 40[13]/.test(m)) return 'El servidor rechazó el acceso (HTTP ' + m.slice(5) + '). Revisa usuario, contraseña y si tu suscripción está activa.';
+      return 'El servidor no respondió a tiempo (caído o saturado, o la lista es enorme y el proxy lento). Reintenta; si persiste, revisa host y puerto con tu proveedor.';
+    if (/HTTP 403/.test(m))
+      return 'El servidor devolvió 403 (prohibido). Muchos paneles IPTV bloquean las IPs de la nube o de los proxies: la app publicada en internet no puede entrar, pero sí puede el archivo local. Descarga la carpeta del proyecto y abre index.html con doble clic, o usa el micro-proxy local del Asistente de conexión. Si también falla ahí, revisa usuario, clave y suscripción.';
+    if (/HTTP 40[14]/.test(m)) return 'El servidor rechazó el acceso (HTTP ' + m.slice(5) + '). Revisa usuario, contraseña y si tu suscripción está activa.';
     return m;
   },
 };
@@ -1854,12 +1878,19 @@ const Accounts = {
   /** Descifra la contraseña para reconstruir el cliente API. */
   async passwordOf(acc) { return Crypt.dec(acc.passEnc); },
 
-  /** Añade una cuenta «por URL» (playlist M3U): prueba la URL y la guarda cifrada. */
+  /** Añade una cuenta «por URL» (playlist M3U): prueba la URL y la guarda cifrada.
+   *  Las listas reales pesan decenas de MB (una m3u_plus típica: 40-60 MB), así
+   *  que hay tiempo de sobra, progreso visible y respaldo de rutas en Net.text. */
   async addM3u({ alias, m3uUrl, onStep }) {
     const url = String(m3uUrl || '').trim();
     if (!/^https?:\/\//i.test(url)) throw new Error('La URL debe empezar por http:// o https://');
     if (onStep) onStep('leyendo lista M3U…');
-    const text = await Net.text(url, 30000, onStep);
+    const onBytes = (recv, total) => {
+      if (!onStep) return;
+      const mb = x => (x / 1048576).toFixed(1);
+      onStep(total ? 'descargando lista… ' + mb(recv) + ' / ' + mb(total) + ' MB' : 'descargando lista… ' + mb(recv) + ' MB');
+    };
+    const text = await Net.text(url, 150000, onStep, onBytes);
     const t = String(text || '');
     if (t.indexOf('#EXTM3U') < 0 && !/#EXTINF/i.test(t))
       throw new Error('Esa URL no devolvió una lista M3U válida (revisa la URL y que esté activa)');
@@ -1877,6 +1908,9 @@ const Accounts = {
     };
     await DB.put('accounts', acc);
     this.list.push(acc);
+    // La lista ya está descargada: la guardo cruda para que Session.load no la
+    // vuelva a bajar (en listas de 50 MB eso es un minuto entero de espera).
+    try { await CatCache.put('acc:' + acc.id + ':m3u1:raw', { text: t }); } catch (_e) { /* sin caché, no pasa nada */ }
     return acc;
   },
 
@@ -2000,14 +2034,24 @@ function parseM3U(text) {
     return catIdx[k];
   };
 
+  /* Clasificación. Además de las rutas clásicas Xtream (/movie/, /series/), hay
+   * paneles que entregan enlaces tokenizados tipo /play/<código>#.mkv (o /play/
+   * <código>/m3u8): ahí la ruta no dice nada, pero la pseudo-extensión sí — los
+   * canales en directos van en HLS (.m3u8, .ts) y el resto son archivos de
+   * vídeo (películas, y series si el nombre trae S01E02 / 1x02). */
+  const M3U_VOD_EXT = { mp4: 1, m4v: 1, mkv: 1, avi: 1, mpg: 1, mpeg: 1, wmv: 1, flv: 1, mov: 1, webm: 1 };
+  const M3U_LIVE_EXT = { ts: 1, m3u8: 1, mpd: 1 };
   const seriesMap = {};
   let id = 0;
   for (const it of raw) {
     id++;
     const u = it.url || '';
-    const isSer = /\/series?\//i.test(u);
-    const isVod = !isSer && /\/movie[s]?\/|\/videos?\//i.test(u);
-    if (isSer) {
+    const ext = m3uExt(u);
+    const isSerPath = /\/series?\//i.test(u);
+    const isVodPath = !isSerPath && /\/movie[s]?\/|\/videos?\//i.test(u);
+    const fileVod = !!(M3U_VOD_EXT[ext] && !isVodPath);      // archivo de vídeo sin ruta clásica
+    const nameSer = fileVod && (M3U_SE_RE.test(it.name) || M3U_X_RE.test(it.name));
+    if (isSerPath || nameSer) {
       const mm = M3U_SE_RE.exec(it.name) || M3U_X_RE.exec(it.name);
       let base = it.name, season = 1, epnum = 0, eptitle = '';
       if (mm) {
@@ -2032,7 +2076,7 @@ function parseM3U(text) {
         title: eptitle || ('Episodio ' + (epnum || sItem._m3uEps.length)),
         url: u, container_extension: m3uExt(u) || 'mp4', info: {},
       });
-    } else if (isVod) {
+    } else if (isVodPath || fileVod) {
       vod.push({
         stream_id: id, name: it.name, stream_icon: it.logo,
         category_id: catId('vod', it.group), container_extension: m3uExt(u) || 'mp4',
@@ -2117,25 +2161,30 @@ const Session = {
 
   /** Carga de cuentas «por URL» (playlist M3U / m3u_plus): descarga la lista,
    *  la parsea y clasifica en los mismos catálogos que la API Xtream.
-   *  La lista parseada queda en caché (mismo TTL que los catálogos Xtream). */
+   *  En caché se guarda el TEXTO crudo (no los 145.000 objetos parseados): ocupa
+   *  4 veces menos en IndexedDB, nunca revienta la cuota y además permite que
+   *  las mejoras del parser se apliquen a la lista ya descargada. */
   async _loadM3u(acc, force) {
     this.client = null;
     const base = 'acc:' + acc.id + ':m3u1:';
     let data = null;
     if (!force) {
-      const cc = await CatCache.get(base + 'play');
-      if (cc && cc.live && cc.series) data = cc;
+      const raw = await CatCache.get(base + 'raw');
+      if (raw && raw.text) {
+        const t = String(raw.text);
+        if (t.indexOf('#EXTM3U') >= 0 || /#EXTINF/i.test(t)) data = parseM3U(t);
+      }
     }
     if (!data) {
       let url = '';
       try { url = (await Accounts.m3uUrlOf(acc)) || ''; } catch (_e) { url = ''; }
       if (!url) throw new Error('No se pudo descifrar la URL de la lista M3U');
-      const text = await Net.text(url, 30000);
+      const text = await Net.text(url, 150000);
       const t = String(text || '');
       if (t.indexOf('#EXTM3U') < 0 && !/#EXTINF/i.test(t))
         throw new Error('La URL no devolvió una playlist M3U válida (revisa la URL y tu suscripción)');
+      try { await CatCache.put(base + 'raw', { text: t }); } catch (_e) { /* cuota: se re-descarga la próxima */ }
       data = parseM3U(t);
-      if (data.live.length + data.vod.length + data.series.length) await CatCache.put(base + 'play', data);
     }
     let hidden = 0;
     const put = (type, cats, items) => {
@@ -3591,9 +3640,10 @@ const Player = {
     this.el.next.addEventListener('click', () => this.step(1));
     this.el.fav.addEventListener('click', () => this.toggleFav());
     this.el.catx.addEventListener('click', () => this.closeCats());
-    if (this.el.pip && document.pictureInPictureEnabled)
+    if (this.el.pip && document.pictureInPictureEnabled && this.video.requestPictureInPicture) {
+      this.el.pip.hidden = false;                 // el botón nace oculto en el HTML
       this.el.pip.addEventListener('click', () => this.togglePip());
-    else this.el.pip.hidden = true;
+    } else if (this.el.pip) this.el.pip.hidden = true;
 
     this.el.vol.addEventListener('input', e => this.setVolume(Number(e.target.value) / 100));
     // Barra de progreso: mientras se arrastra solo se previsualiza; al soltar se salta.
@@ -3628,7 +3678,8 @@ const Player = {
     v.addEventListener('volumechange', () => this.syncVolUI());
     v.addEventListener('error', () => {
       if (this.isOpenFlag && v.error && this.el.error.hidden) {
-        const c = v.error.code;                       // 3=decodificación · 4=formato no soportado
+        const c = v.error.code;                       // 2=red · 3=decodificación · 4=formato no soportado
+        if ((c === 2 || c === 3 || c === 4) && this.tryDirect()) return;   // ¿el proxy era el problema?
         if ((c === 3 || c === 4) && this.tryAltExt()) return;   // ¿era la extensión del archivo?
         this.plError(c === 3 || c === 4 ? 'format' : 'net');
       }
@@ -3694,8 +3745,10 @@ const Player = {
     this._lastOpts = opts;
     this._retryCount = 0;
     this._proxyTried = false;
+    this._directTried = false;
     this._scrubbing = false;
     this._altExts = null;
+    this._srcWrapped = null;      // ¿la fuente actual sale por un proxy? (null=decidir)
     this._seekTarget = 0; this._seekAt = 0;
     this._seekRetries = 0; this._seekWarned = false;
     this._fav = opts.fav || null;
@@ -3732,10 +3785,10 @@ const Player = {
     this.el.prev.hidden = !stepable;
     this.el.next.hidden = !stepable;
     this.el.hints.textContent = opts.isLive
-      ? '↑↓ o W/S canal · C categorías · R grabar · L favorito · Q calidad · M silencio · Espacio pausa · F pantalla · Esc salir'
+      ? '↑↓ o W/S canal · C categorías · R grabar · L favorito · Q calidad · P imagen en imagen · M silencio · Espacio pausa · F pantalla · Esc salir'
       : opts.kind === 'episode'
-        ? '←→ o A/D 10 s · ↑↓ o W/S episodio · B descarga · L favorito · Q calidad · M silencio · F pantalla · Esc salir'
-        : '←→ o A/D 10 s · B descarga · L favorito · Q calidad · M silencio · F pantalla · Esc salir';
+        ? '←→ o A/D 10 s · ↑↓ o W/S episodio · B descarga · L favorito · Q calidad · P imagen en imagen · M silencio · F pantalla · Esc salir'
+        : '←→ o A/D 10 s · B descarga · L favorito · Q calidad · P imagen en imagen · M silencio · F pantalla · Esc salir';
     this.el.livebadge.hidden = !opts.isLive;
     this.el.seek.hidden = !!opts.isLive;
     this.syncTime();
@@ -3767,15 +3820,24 @@ const Player = {
       v.srcObject = this.demoSrc.stream;
       return;
     }
-    if (opts.kind === 'local' || !/\.m3u8($|\?)/i.test(opts.url)) {
-      v.src = Net.streamFile(opts.url); v.srcObject = null;   // <video> nativo: no sufre CORS
+    if (opts.kind === 'local' || !/m3u8([?#]|$)/i.test(opts.url)) {
+      // <video> nativo: no sufre CORS. Detecta HLS con o sin punto (los paneles
+      // tokenizados sirven rutas tipo /play/<cód>/m3u8 sin extensión).
+      if (this._srcWrapped === false) {                 // ya probamos directo: seguir directo
+        v.src = opts.url; v.srcObject = null;
+        return;
+      }
+      const sf = Net.streamFile(opts.url);
+      this._srcWrapped = sf !== opts.url;               // recuerda si la fuente salió por proxy
+      v.src = sf; v.srcObject = null;
       return;
     }
     // HLS: Hls.js con fallback nativo (Safari/iOS)
     if (window.Hls && Hls.isSupported()) {
       // ¿Todas las peticiones (manifiesto + segmentos) deben salir por un proxy?
-      const wantProxy = !!opts.forceProxyLoader || Net.isProxied() ||
-        (Net.publicOn() && S.get('corsMode') === 'always');
+      const wantProxy = !opts.noWrap && (!!opts.forceProxyLoader || Net.isProxied() ||
+        (Net.publicOn() && S.get('corsMode') === 'always'));
+      this._srcWrapped = wantProxy;                     // HLS por proxy = candidato al respaldo directo
       const cfg = {
         manifestLoadingTimeOut: 15000,
         manifestLoadingMaxRetry: 2,
@@ -3810,6 +3872,16 @@ const Player = {
         if (!data.fatal) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           if (this._retryCount < 1) { this._retryCount++; hls.startLoad(); }
+          else if (!this._directTried && this._srcWrapped && !opts.forceProxyLoader &&
+                   !(location.protocol === 'https:' && /^http:/i.test(opts.url))) {
+            // 2º intento: SIN proxy (los paneles que bloquean la nube suelen servir
+            // bien al navegador del usuario; hls.js necesita CORS y muchos lo envían).
+            this._directTried = true;
+            try { hls.destroy(); } catch (_e) { /* noop */ }
+            if (this.hls === hls) this.hls = null;
+            this.spin(true);
+            this._setupSource(Object.assign({}, opts, { noWrap: true }));
+          }
           else if (!this._proxyTried && !opts.forceProxyLoader && Net.publicOn() && S.get('corsMode') !== 'off') {
             // Último recurso: reenviar TODO el stream (manifiesto + segmentos) por el proxy público
             this._proxyTried = true;
@@ -3824,6 +3896,7 @@ const Player = {
         } else this.plError('net');
       });
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+      this._srcWrapped = Net.streamSrc(opts.url) !== opts.url;
       v.src = Net.streamSrc(opts.url); v.srcObject = null;   // HLS nativo (Safari/WebKit)
     } else {
       this.plError('hls');
@@ -3845,10 +3918,27 @@ const Player = {
     clearTimeout(this._wdTimer);
     this._wdTimer = setTimeout(() => {
       if (this.isOpenFlag && this.video.readyState < 3 && this.el.error.hidden) {
+        if (this.tryDirect()) return;            // ¿el proxy era el problema?
         if (this.tryAltExt()) return;
         this.plError('slow');
       }
     }, 16000);
+  },
+
+  /** Reintenta la señal SIN proxy: los <video> no necesitan CORS y muchos paneles
+   *  IPTV bloquean las IPs de la nube (403 al proxy) pero sirven bien al navegador
+   *  del usuario. Solo se intenta una vez y nunca con contenido mixto https→http. */
+  tryDirect() {
+    const o = this._lastOpts;
+    if (!o || !o.url || this._srcWrapped === false || this._directTried) return false;
+    if (location.protocol === 'https:' && /^http:/i.test(o.url)) return false;
+    this._directTried = true;
+    this._srcWrapped = false;
+    this.spin(true);
+    this.video.src = o.url;
+    this.video.srcObject = null;
+    this._armWatchdog();
+    return true;
   },
 
   /** Respaldo de extensión para VOD: muchos paneles anuncian .mp4 pero sirven el archivo
@@ -3909,18 +3999,29 @@ const Player = {
       hls: ['Formato no soportado',
         'Tu navegador no soporta HLS ni de forma nativa ni vía Hls.js (¿sin conexión al CDN?). Prueba con Chrome, Edge o Safari actualizados.'],
       format: ['Este vídeo no se puede reproducir en el navegador',
-        'El archivo llegó en un formato o códec que el navegador no decodifica (típico en MKV/AVI con HEVC, DTS o AC3, o en MPEG-TS). No es un fallo de tu red ni de la cuenta: prueba otro contenido, o descárgalo con la tecla <b>D</b> para verlo en un reproductor de escritorio.'],
+        'El archivo llegó en un formato o códec que el navegador no decodifica (típico en MKV/AVI con HEVC, DTS o AC3, o en MPEG-TS). No es un fallo de tu red ni de la cuenta: usa <b>Copiar enlace</b> y ábrelo en VLC (Medio → Abrir ubicación de red), o descárgalo con la tecla <b>D</b> para verlo en tu reproductor de escritorio.'],
       slow: ['El servidor tarda demasiado en responder',
         'La señal no entrega datos (se queda cargando). Suele ser saturación del servidor IPTV o un corte puntual. Reintenta, prueba otro contenido, o usa <b>D</b> para descargarlo y verlo con calma.'],
     };
     const [t, m] = msgs[kind] || msgs.net;
+    const lo = this._lastOpts;
+    const canCopy = !!(lo && lo.url && /^https?:/i.test(lo.url) && navigator.clipboard && navigator.clipboard.writeText);
     e.innerHTML = '';
     e.append(el('div', { class: 'card-err' },
       el('div', { class: 'ic', html: I('wifi', 24) }),
       el('h3', {}, t),
       el('p', { html: m }),
-      el('div', { style: 'display:flex;gap:10px;justify-content:center' },
+      el('div', { style: 'display:flex;gap:10px;justify-content:center;flex-wrap:wrap' },
         el('button', { class: 'btn btn-primary', 'data-focus': '', html: I('refresh', 17) + '<span>Reintentar</span>', onclick: () => { e.hidden = true; this.spin(true); this._setupSource(this._lastOpts); } }),
+        canCopy ? el('button', {
+          class: 'btn btn-glass', 'data-focus': '',
+          html: I('copy', 17) + '<span>Copiar enlace (VLC)</span>',
+          onclick: () => {
+            navigator.clipboard.writeText(Net.unwrap(lo.url))
+              .then(() => Toast.ok('Enlace copiado. En VLC: Medio → Abrir ubicación de red.'))
+              .catch(() => Toast.err('No se pudo copiar el enlace.'));
+          },
+        }) : null,
         el('button', { class: 'btn btn-glass', 'data-focus': '', onclick: () => this.requestClose() }, 'Cerrar'))));
     e.hidden = false;
   },
@@ -4038,8 +4139,13 @@ const Player = {
     else if (this.el.root.requestFullscreen) this.el.root.requestFullscreen().catch(() => Toast.info('Pantalla completa no disponible aquí'));
   },
   togglePip() {
-    if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
-    else this.video.requestPictureInPicture().catch(() => Toast.info('Picture-in-Picture no disponible'));
+    const v = this.video;
+    if (document.pictureInPictureElement) { document.exitPictureInPicture().catch(() => {}); return; }
+    if (!document.pictureInPictureEnabled || !v.requestPictureInPicture) {
+      Toast.err('Tu navegador no soporta Picture-in-Picture (imagen en imagen).');
+      return;
+    }
+    v.requestPictureInPicture().catch(() => Toast.err('No se pudo abrir Picture-in-Picture: espera a que el vídeo cargue e inténtalo de nuevo.'));
   },
   download() {
     const o = this._lastOpts;
@@ -4239,6 +4345,7 @@ const Player = {
         else if (this.isLive) Toast.info('El canal de demostración no tiene lista de canales.');
         break;
       case 'f': case 'F': this.toggleFull(); break;
+      case 'p': case 'P': this.togglePip(); break;
       case 'm': case 'M': this.toggleMute(); break;
       case 'r': case 'R': if (this.canRecord) PVR.toggle(this); break;
       case 'b': case 'B': if (this.canDownload) this.download(); break;
@@ -4911,7 +5018,7 @@ function renderSettingsView() {
   v.innerHTML = '';
   v.append(el('div', { class: 'view-head' },
     el('h2', { class: 'view-title' }, el('span', { class: 'dot' }), 'Ajustes'),
-    el('span', { class: 'view-sub' }, 'DJ-IPTV v1.5 · HTML + CSS + JS')));
+    el('span', { class: 'view-sub' }, 'DJ-IPTV v1.6 · HTML + CSS + JS')));
 
   const g = el('div', { class: 'set-grid' });
 
@@ -5174,7 +5281,7 @@ function globalKeys(e) {
 
   window.__DJ_READY__ = true;   // desactiva el aviso de compatibilidad
   const style = 'color:#0A84FF;font-weight:bold;font-size:14px';
-  console.log('%c DJ-IPTV v1.5 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
+  console.log('%c DJ-IPTV v1.6 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
 })();
 </script>
 </body>
