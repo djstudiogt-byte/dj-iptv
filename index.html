@@ -1345,6 +1345,67 @@ const Net = {
       throw e;
     } finally { clearTimeout(t); }
   },
+  /** Un intento fetch→texto (listas M3U). Mismo control de errores que _once. */
+  async _onceText(finalUrl, timeout) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeout);
+    try {
+      const r = await fetch(finalUrl, { signal: ctl.signal, cache: 'no-store' });
+      if (!r.ok) {
+        const err = new Error('HTTP ' + r.status);
+        err.__status = r.status;
+        throw err;
+      }
+      return await r.text();
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        const err = new Error('El servidor tardó demasiado en responder');
+        err.__timeout = true;
+        throw err;
+      }
+      if (!(e && e.__status)) {
+        const err = (e instanceof Error) ? e : new Error(String(e));
+        err.__net = true;
+        throw err;
+      }
+      throw e;
+    } finally { clearTimeout(t); }
+  },
+  /** fetch TEXTO con reserva: directo → proxies públicos (o micro-proxy propio).
+   *  Igual que json() pero devuelve el cuerpo tal cual (para listas M3U grandes). */
+  async text(url, timeout = 15000, onStep) {
+    const mode = S.get('corsMode') || 'auto';
+    if (this.isProxied()) {
+      const d = await this._onceText(this.proxied(url), timeout);
+      this.lastVia = 'local'; return d;
+    }
+    if (mode === 'always' && this.publicOn()) {
+      const d = await this._onceText(this.publicWrap(url), Math.max(timeout, 20000));
+      this.lastVia = 'public'; return d;
+    }
+    if (mode === 'off') {
+      const d = await this._onceText(url, timeout);
+      this.lastVia = 'direct'; return d;
+    }
+    try {
+      if (onStep) onStep('conexión directa…');
+      const d = await this._onceText(url, timeout);
+      this.lastVia = 'direct'; return d;
+    } catch (e) {
+      if (!this._isNetErr(e)) throw e;
+      const tpls = this.chain();
+      let last = e;
+      for (let i = 0; i < tpls.length; i++) {
+        if (onStep) onStep('proxy público ' + (i + 1) + '/' + tpls.length + '…');
+        try {
+          const d = await this._onceText(this.applyTpl(tpls[i], url), Math.max(timeout, 20000));
+          if (S.get('corsTpl') !== tpls[i]) S.set('corsTpl', tpls[i]);
+          this.lastVia = 'public'; return d;
+        } catch (e2) { last = e2; }
+      }
+      throw this._blockErr(last);
+    }
+  },
   /** fetch JSON con reserva: directo → proxies públicos (o micro-proxy propio). */
   async json(url, timeout = 15000, onStep) {
     const mode = S.get('corsMode') || 'auto';
@@ -1792,6 +1853,35 @@ const Accounts = {
 
   /** Descifra la contraseña para reconstruir el cliente API. */
   async passwordOf(acc) { return Crypt.dec(acc.passEnc); },
+
+  /** Añade una cuenta «por URL» (playlist M3U): prueba la URL y la guarda cifrada. */
+  async addM3u({ alias, m3uUrl, onStep }) {
+    const url = String(m3uUrl || '').trim();
+    if (!/^https?:\/\//i.test(url)) throw new Error('La URL debe empezar por http:// o https://');
+    if (onStep) onStep('leyendo lista M3U…');
+    const text = await Net.text(url, 30000, onStep);
+    const t = String(text || '');
+    if (t.indexOf('#EXTM3U') < 0 && !/#EXTINF/i.test(t))
+      throw new Error('Esa URL no devolvió una lista M3U válida (revisa la URL y que esté activa)');
+    const n = (t.match(/#EXTINF/gi) || []).length;
+    if (!n) throw new Error('La lista no contiene ningún elemento');
+    const acc = {
+      id: uid(),
+      alias: (alias || 'Lista M3U').slice(0, 40),
+      type: 'm3u',
+      m3uEnc: await Crypt.enc(url),
+      hue: Math.floor(Math.random() * 360),
+      status: 'Active',
+      createdAt: Date.now(),
+      lastSync: Date.now(),
+    };
+    await DB.put('accounts', acc);
+    this.list.push(acc);
+    return acc;
+  },
+
+  /** Descifra la URL M3U para volver a descargar la lista. */
+  async m3uUrlOf(acc) { return Crypt.dec(acc.m3uEnc); },
 };
 
 /* ---------- Caché de catálogos con TTL (por cuenta) ---------- */
@@ -1848,12 +1938,133 @@ function filterAdultCatalog(cats, items) {
   return { cats: keep, items: okItems, hidden: nBad };
 }
 
-/* ---------- Sesión: catálogo activo (cuenta real o demo) ---------- */
+/* ---------- Listas M3U (m3u_plus): parser y clasificación ----------
+ * Convierte el texto de una lista .m3u en los mismos catálogos que la API
+ * Xtream (TV en vivo / películas / series), para cuentas «por URL».
+ * Clasificación por ruta del enlace:  /movie/  → película ·  /series/ → serie
+ * (cada línea S01E02 se agrupa con su serie) · el resto → canal en vivo. */
+const M3U_SE_RE = /(?:^|[^a-z0-9])s(\d{1,2})[\s._\-|]?e(\d{1,3})(?![a-z0-9])/i;   // S01E02 · s1e2
+const M3U_X_RE  = /(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?![a-z0-9])/i;              // 1x02
+
+function m3uTitle(line, attrs) {
+  const q = line.lastIndexOf('"');
+  const c = line.indexOf(',', q >= 0 ? q : 8);
+  let t = c >= 0 ? line.slice(c + 1).trim() : '';
+  if (!t) t = attrs.tvg_name || attrs.tvgname || '';
+  return t || 'Sin nombre';
+}
+
+function m3uExt(url) {
+  const m = String(url).match(/\.([a-z0-9]{2,5})(?:\?|#|$)/i);
+  return m ? m[1].toLowerCase() : '';
+}
+
+function parseM3U(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const raw = [];
+  let cur = null;
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i].trim();
+    if (!ln) continue;
+    if (/^#EXTM3U/i.test(ln)) continue;
+    if (/^#EXTINF/i.test(ln)) {
+      const attrs = {};
+      try {
+        const am = ln.match(/[a-zA-Z0-9_-]+="[^"]*"/g) || [];
+        for (const a of am) { const j = a.indexOf('="'); attrs[a.slice(0, j).toLowerCase()] = a.slice(j + 2, -1); }
+      } catch (_e) { /* línea sin atributos */ }
+      cur = {
+        name: m3uTitle(ln, attrs),
+        logo: attrs.tvg_logo || attrs['tvg-logo'] || attrs.logo || '',
+        group: attrs.group_title || attrs['group-title'] || '',
+        url: '',
+      };
+      continue;
+    }
+    if (/^#EXTGRP/i.test(ln)) { if (cur) cur.group = ln.replace(/^#EXTGRP:?/i, '').trim() || cur.group; continue; }
+    if (ln.charAt(0) === '#') continue;                    // otras directivas: se ignoran
+    if (cur) { cur.url = ln; raw.push(cur); cur = null; }  // la línea tras EXTINF es el enlace
+  }
+
+  const liveCats = [], vodCats = [], seriesCats = [];
+  const live = [], vod = [], series = [];
+  const catIdx = {};
+  const catId = (type, g) => {
+    const name = g || 'Sin categoría';
+    const k = type + '|' + name.toLowerCase();
+    if (!catIdx[k]) {
+      catIdx[k] = String(Object.keys(catIdx).length + 1);
+      const arr = type === 'live' ? liveCats : type === 'vod' ? vodCats : seriesCats;
+      arr.push({ category_id: catIdx[k], category_name: name });
+    }
+    return catIdx[k];
+  };
+
+  const seriesMap = {};
+  let id = 0;
+  for (const it of raw) {
+    id++;
+    const u = it.url || '';
+    const isSer = /\/series?\//i.test(u);
+    const isVod = !isSer && /\/movie[s]?\/|\/videos?\//i.test(u);
+    if (isSer) {
+      const mm = M3U_SE_RE.exec(it.name) || M3U_X_RE.exec(it.name);
+      let base = it.name, season = 1, epnum = 0, eptitle = '';
+      if (mm) {
+        base = it.name.slice(0, mm.index);
+        if (mm[3] != null) { season = Number(mm[3]) || 1; epnum = Number(mm[4]) || 0; }
+        else { season = Number(mm[1]) || 1; epnum = Number(mm[2]) || 0; }
+        eptitle = it.name.slice(mm.index + mm[0].length).replace(/^[\s\-_.·|:]+/, '');
+      }
+      base = base.replace(/[\s\-_.·|]+$/, '').trim() || it.name;
+      const key = base.toLowerCase();
+      if (!seriesMap[key]) {
+        seriesMap[key] = true;
+        series.push({
+          series_id: id, name: base, cover: it.logo, stream_icon: it.logo,
+          category_id: catId('series', it.group), plot: '', rating: 0, last_modified: 0,
+          _m3uEps: [],
+        });
+      }
+      const sItem = series[series.length - 1];
+      sItem._m3uEps.push({
+        id: 'e' + id, season: season, episode_num: epnum,
+        title: eptitle || ('Episodio ' + (epnum || sItem._m3uEps.length)),
+        url: u, container_extension: m3uExt(u) || 'mp4', info: {},
+      });
+    } else if (isVod) {
+      vod.push({
+        stream_id: id, name: it.name, stream_icon: it.logo,
+        category_id: catId('vod', it.group), container_extension: m3uExt(u) || 'mp4',
+        url: u, rating: 0, added: 0,
+      });
+    } else {
+      live.push({ stream_id: id, name: it.name, stream_icon: it.logo, category_id: catId('live', it.group), url: u });
+    }
+  }
+
+  // Episodios: numerar los que quedaron en 0 y ordenar por temporada/episodio
+  for (const s of series) {
+    const by = {};
+    for (const ep of s._m3uEps) (by[ep.season] = by[ep.season] || []).push(ep);
+    const out = [];
+    Object.keys(by).map(Number).sort((a, b) => a - b).forEach(sn => {
+      const arr = by[sn];
+      arr.sort((a, b) => (a.episode_num || 0) - (b.episode_num || 0) || String(a.title).localeCompare(String(b.title), 'es'));
+      let n = 0;
+      for (const ep of arr) { if (!ep.episode_num) { n++; ep.episode_num = n; } else n = ep.episode_num; out.push(ep); }
+    });
+    s._m3uEps = out;
+  }
+  return { liveCats, live, vodCats, vod, seriesCats, series };
+}
+
+/* ---------- Sesión: catálogo activo (cuenta real, M3U o demo) ---------- */
 const Session = {
   ready: false,
   isDemo: false,
   account: null,
-  client: null,          // XtreamClient activo
+  client: null,          // XtreamClient activo (null en cuentas M3U)
   liveCats: [], live: [],
   vodCats: [],  vod: [],
   seriesCats: [], series: [],
@@ -1882,6 +2093,7 @@ const Session = {
 
     try {
       if (this.isDemo) await this._loadDemo();
+      else if (acc.type === 'm3u') await this._loadM3u(acc, force);
       else await this._loadReal(acc, force);
       this.ready = true;
       this.rev++;
@@ -1901,6 +2113,47 @@ const Session = {
     this.vodCats = DemoData.moviesCats(); this.vod = DemoData.moviesView();
     this.seriesCats = DemoData.seriesCats(); this.series = DemoData.seriesView();
     await new Promise(r => setTimeout(r, 260)); // deja ver el estado de carga
+  },
+
+  /** Carga de cuentas «por URL» (playlist M3U / m3u_plus): descarga la lista,
+   *  la parsea y clasifica en los mismos catálogos que la API Xtream.
+   *  La lista parseada queda en caché (mismo TTL que los catálogos Xtream). */
+  async _loadM3u(acc, force) {
+    this.client = null;
+    const base = 'acc:' + acc.id + ':m3u1:';
+    let data = null;
+    if (!force) {
+      const cc = await CatCache.get(base + 'play');
+      if (cc && cc.live && cc.series) data = cc;
+    }
+    if (!data) {
+      let url = '';
+      try { url = (await Accounts.m3uUrlOf(acc)) || ''; } catch (_e) { url = ''; }
+      if (!url) throw new Error('No se pudo descifrar la URL de la lista M3U');
+      const text = await Net.text(url, 30000);
+      const t = String(text || '');
+      if (t.indexOf('#EXTM3U') < 0 && !/#EXTINF/i.test(t))
+        throw new Error('La URL no devolvió una playlist M3U válida (revisa la URL y tu suscripción)');
+      data = parseM3U(t);
+      if (data.live.length + data.vod.length + data.series.length) await CatCache.put(base + 'play', data);
+    }
+    let hidden = 0;
+    const put = (type, cats, items) => {
+      const f = filterAdultCatalog(cats, items);
+      hidden += f.hidden;
+      if (type === 'live') { this.liveCats = f.cats; this.live = f.items; }
+      else if (type === 'vod') { this.vodCats = f.cats; this.vod = f.items; }
+      else { this.seriesCats = f.cats; this.series = f.items; }
+    };
+    put('live', data.liveCats, data.live);
+    put('vod', data.vodCats, data.vod);
+    put('series', data.seriesCats, data.series);
+    if (hidden && !this._adultToastShown) {
+      this._adultToastShown = true;
+      Toast.info('Contenido adulto oculto (' + hidden + (hidden === 1 ? ' categoría).' : ' categorías).'));
+    }
+    acc.lastSync = Date.now();
+    Accounts.update(acc);
   },
 
   async _loadReal(acc, force) {
@@ -2001,10 +2254,12 @@ const Session = {
   },
   vodUrl(item) {
     if (item.demo) return null; // la demo reproduce su señal sintética
+    if (item.url) return item.url;   // cuentas M3U: enlace directo de la lista
     return this.client.movieUrl(item.stream_id, item.container_extension || 'mp4');
   },
   liveUrl(item) {
     if (item.demo) return null;
+    if (item.url) return item.url;   // cuentas M3U: enlace directo de la lista
     return this.client.liveUrl(item.stream_id);
   },
 };
@@ -2276,6 +2531,11 @@ function openAccountModal(acc) {
   const fPort = el('input', { type: 'text', placeholder: '8080', value: acc ? acc.port : '' });
   const fUser = el('input', { type: 'text', placeholder: 'usuario', value: acc ? acc.username : '' });
   const fPass = el('input', { type: 'password', placeholder: '••••••••', value: '' });
+  const fM3u = el('input', {
+    type: 'url',
+    placeholder: 'http://miservidor.tv:8080/get.php?username=TU_USUARIO&password=TU_CLAVE&type=m3u_plus&output=m3u8',
+    value: '',
+  });
   const btn = el('button', { class: 'btn btn-primary', 'data-focus': '', html: I('key', 18) + '<span>' + (acc ? 'Guardar cambios' : 'Probar y guardar') + '</span>' });
   const btnHelp = el('button', {
     class: 'btn btn-glass btn-sm', hidden: true, 'data-focus': '',
@@ -2283,25 +2543,83 @@ function openAccountModal(acc) {
     onclick: () => openNetWizard(() => { if (!btn.disabled) btn.click(); }),
   });
 
+  // Dos modos de cuenta: servidor Xtream (host/puerto/usuario/clave) o URL de lista M3U
+  const rowHostPort = el('div', { class: 'row2' },
+    el('div', { class: 'field' }, el('label', {}, 'Host'), fHost),
+    el('div', { class: 'field' }, el('label', {}, 'Puerto'), fPort));
+  const fieldUser = el('div', { class: 'field' }, el('label', {}, 'Usuario'), fUser);
+  const fieldPass = el('div', { class: 'field' }, el('label', {}, acc && acc.type !== 'm3u' ? 'Contraseña (dejar vacío = sin cambios)' : 'Contraseña'), fPass);
+  const fieldM3u = el('div', { class: 'field' },
+    el('label', {}, acc && acc.type === 'm3u' ? 'URL de la lista M3U (dejar vacía = sin cambios)' : 'URL de la lista M3U'),
+    fM3u,
+    el('p', { class: 'hint' }, 'Pega la URL get.php?type=m3u_plus que te da tu proveedor. Los datos van dentro de la URL y se guardan cifrados en tu navegador.'));
+  const tabX = el('button', { type: 'button', class: 'chip', 'data-focus': '', onclick: () => setMode('x') }, 'Servidor Xtream');
+  const tabM = el('button', { type: 'button', class: 'chip', 'data-focus': '', onclick: () => setMode('m3u') }, 'Lista M3U (URL)');
+  const tabs = el('div', { class: 'chips', style: 'margin:2px 0 12px' }, tabX, tabM);
+  let mode = acc && acc.type === 'm3u' ? 'm3u' : 'x';
+  const setMode = mv => {
+    mode = mv;
+    tabX.classList.toggle('active', mv === 'x');
+    tabM.classList.toggle('active', mv === 'm3u');
+    rowHostPort.hidden = mv !== 'x';
+    fieldUser.hidden = mv !== 'x';
+    fieldPass.hidden = mv !== 'x';
+    fieldM3u.hidden = mv !== 'm3u';
+  };
+
   const m = Modal.open(veil => el('div', { class: 'modal slim' },
     el('button', { class: 'modal-x', html: I('x', 17), 'aria-label': 'Cerrar', onclick: () => m.close() }),
     el('div', { class: 'form' },
-      el('h3', { html: I('user', 21) + '<span>' + (acc ? 'Editar cuenta' : 'Añadir cuenta Xtream') + '</span>' }),
+      el('h3', { html: I('user', 21) + '<span>' + (acc ? 'Editar cuenta' : 'Añadir cuenta') + '</span>' }),
       el('p', { class: 'hint' }, 'Los datos se guardan cifrados (AES-GCM) en tu navegador. Se usan únicamente para conectar con tu servidor IPTV.'),
       err,
       stat,
+      tabs,
       el('div', { class: 'field' }, el('label', {}, 'Alias'), fAlias),
-      el('div', { class: 'row2' },
-        el('div', { class: 'field' }, el('label', {}, 'Host'), fHost),
-        el('div', { class: 'field' }, el('label', {}, 'Puerto'), fPort)),
-      el('div', { class: 'field' }, el('label', {}, 'Usuario'), fUser),
-      el('div', { class: 'field' }, el('label', {}, acc ? 'Contraseña (dejar vacío = sin cambios)' : 'Contraseña'), fPass),
+      rowHostPort,
+      fieldUser,
+      fieldPass,
+      fieldM3u,
       el('div', { class: 'form-actions' },
         btnHelp,
         el('button', { class: 'btn btn-glass', 'data-focus': '', onclick: () => m.close() }, 'Cancelar'),
         btn))));
+  setMode(mode);
 
   btn.addEventListener('click', async () => {
+    if (mode === 'm3u') {
+      const u2 = fM3u.value.trim();
+      if (!u2 && !(acc && acc.type === 'm3u')) {
+        err.textContent = 'Pega la URL de tu lista M3U (get.php?type=m3u_plus).';
+        err.classList.add('show'); return;
+      }
+      btn.disabled = true; btn.style.opacity = '.6';
+      err.classList.remove('show');
+      const onStep = txt => { stat.textContent = 'Conectando: ' + txt; stat.style.display = 'block'; };
+      try {
+        if (acc) {
+          acc.alias = fAlias.value.trim() || acc.alias;
+          acc.type = 'm3u';
+          if (u2) acc.m3uEnc = await Crypt.enc(u2);
+          await Accounts.update(acc);
+          Toast.ok('Cuenta actualizada');
+          m.close(); Topbar.renderAccounts();
+          Session.load(acc.id, true);
+        } else {
+          const created = await Accounts.addM3u({ alias: fAlias.value.trim(), m3uUrl: u2, onStep });
+          Toast.ok('Cuenta «' + created.alias + '» conectada');
+          m.close(); Topbar.renderAccounts();
+          Session.load(created.id);
+        }
+      } catch (e) {
+        stat.style.display = 'none';
+        err.textContent = Net.explain(e);
+        btnHelp.hidden = true;
+        err.classList.add('show');
+        btn.disabled = false; btn.style.opacity = '';
+      }
+      return;
+    }
     const host = fHost.value.trim(), user = fUser.value.trim();
     const pass = fPass.value;
     if (!host || !user || (!acc && !pass)) {
@@ -2314,6 +2632,7 @@ function openAccountModal(acc) {
     try {
       if (acc) {
         acc.alias = fAlias.value.trim() || acc.alias;
+        acc.type = '';
         acc.host = host; acc.port = fPort.value.trim(); acc.username = user;
         if (pass) acc.passEnc = await Crypt.enc(pass);
         await Accounts.update(acc);
@@ -2475,7 +2794,7 @@ const Topbar = {
     const items = [];
     for (const a of Accounts.list) {
       items.push({
-        icon: 'user', label: a.alias, sub: a.host + (a.port ? ':' + a.port : '') + ' · ' + (a.status || ''),
+        icon: 'user', label: a.alias, sub: a.type === 'm3u' ? 'Playlist M3U · ' + (a.status || 'Active') : a.host + (a.port ? ':' + a.port : '') + ' · ' + (a.status || ''),
         check: Accounts.activeId === a.id && !Session.isDemo,
         onClick: () => Session.load(a.id),
       });
@@ -3042,7 +3361,7 @@ function openMovieModal(item) {
 
 /* ---------- Modal de serie (temporadas y episodios) ---------- */
 function downloadEpisode(seriesItem, season, ep) {
-  const url = Session.client ? Session.client.episodeUrl(ep.id, ep.container_extension || 'mp4') : null;
+  const url = ep.url || (Session.client ? Session.client.episodeUrl(ep.id, ep.container_extension || 'mp4') : null);
   if (!url) { Toast.err('La señal demo no se puede descargar.'); return; }
   const ext = ep.container_extension || 'mp4';
   DL.add({
@@ -3119,6 +3438,16 @@ async function openSeriesModal(item) {
         if (!item.plot) plotEl.textContent = d.info.plot || '';
         metaRow.append(el('span', {}, item.year || ''));
         metaRow.append(el('span', {}, s.seasons + ' temporadas'));
+      } else if (item._m3uEps && item._m3uEps.length) {
+        // Series de una cuenta M3U: los episodios ya vienen en la propia lista
+        const by = {};
+        for (const ep of item._m3uEps) { const s2 = Number(ep.season) || 1; (by[s2] = by[s2] || []).push(ep); }
+        seasons = Object.keys(by).map(k => ({ season: Number(k), episodes: by[k] }));
+        seasons.sort((a, b) => a.season - b.season);
+        for (const sn of seasons)
+          sn.episodes.sort((a, b) => (Number(a.episode_num) || 0) - (Number(b.episode_num) || 0));
+        plotEl.textContent = item.plot || 'Serie importada de una lista M3U (episodios agrupados por temporada).';
+        metaRow.append(el('span', {}, item._m3uEps.length + (item._m3uEps.length === 1 ? ' episodio' : ' episodios')));
       } else {
         if (!Session.client) throw new Error('No hay cuenta activa: elige tu cuenta arriba y vuelve a abrir la serie.');
         let d = SeriesInfoMem.get(item.series_id);
@@ -3342,7 +3671,7 @@ const Player = {
     }
   },
   openEpisode(seriesItem, season, ep, episodes) {
-    const url = Session.client ? Session.client.episodeUrl(ep.id, ep.container_extension || 'mp4') : null;
+    const url = ep.url || (Session.client ? Session.client.episodeUrl(ep.id, ep.container_extension || 'mp4') : null);
     if (!url) { Toast.err('La señal demo de series no incluye reproducción.'); return; }
     const ext = ep.container_extension || 'mp4';
     this._open({ kind: 'episode', url, title: seriesItem.name,
@@ -4582,7 +4911,7 @@ function renderSettingsView() {
   v.innerHTML = '';
   v.append(el('div', { class: 'view-head' },
     el('h2', { class: 'view-title' }, el('span', { class: 'dot' }), 'Ajustes'),
-    el('span', { class: 'view-sub' }, 'DJ-IPTV v1.2 · HTML + CSS + JS')));
+    el('span', { class: 'view-sub' }, 'DJ-IPTV v1.5 · HTML + CSS + JS')));
 
   const g = el('div', { class: 'set-grid' });
 
@@ -4597,7 +4926,7 @@ function renderSettingsView() {
       el('span', { class: 'avatar', style: 'background:hsl(' + (a.hue || 210) + ',60%,40%);width:34px;height:34px;font-size:13px' }, esc((a.alias[0] || 'U').toUpperCase())),
       el('div', { class: 'inf' },
         el('b', {}, a.alias, isActive ? el('span', { class: 'tag ok' }, 'ACTIVA') : null),
-        el('small', {}, a.host + (a.port ? ':' + a.port : '') + ' · ' + a.username + (a.expDate ? ' · expira ' + fmtDate(Number(a.expDate) * 1000) : ''))),
+        el('small', {}, a.type === 'm3u' ? 'Playlist M3U (URL guardada cifrada)' : a.host + (a.port ? ':' + a.port : '') + ' · ' + a.username + (a.expDate ? ' · expira ' + fmtDate(Number(a.expDate) * 1000) : ''))),
       el('span', { class: 'state-dot ' + (a.status === 'Expired' ? 'err' : isActive ? 'ok' : 'idle'), title: a.status || '' }),
       el('button', { class: 'mini-btn', html: I('refresh', 15), 'data-focus': '', 'aria-label': 'Usar esta cuenta', title: 'Usar', onclick: () => Session.load(a.id) }),
       el('button', { class: 'mini-btn', html: I('edit', 15), 'data-focus': '', 'aria-label': 'Editar', onclick: () => openAccountModal(a) }),
@@ -4772,7 +5101,7 @@ function globalKeys(e) {
 
   const t = e.target;
   const tag = (t.tagName || '').toLowerCase();
-  const typing = (tag === 'input' && ['text', 'password', 'search', 'number', 'email'].includes(t.type)) || tag === 'textarea' || tag === 'select';
+  const typing = (tag === 'input' && ['text', 'password', 'search', 'number', 'email', 'url'].includes(t.type)) || tag === 'textarea' || tag === 'select';
   if (typing) return;
 
   // 5 · Focus engine (D-Pad espacial · también WASD)
@@ -4845,7 +5174,7 @@ function globalKeys(e) {
 
   window.__DJ_READY__ = true;   // desactiva el aviso de compatibilidad
   const style = 'color:#0A84FF;font-weight:bold;font-size:14px';
-  console.log('%c DJ-IPTV v1.4 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
+  console.log('%c DJ-IPTV v1.5 ', style + ';background:#0f172a;border-radius:4px', '· cliente 100% web · Hls.js:' + (window.Hls ? 'ok' : 'CDN pendiente') + ' · IDB:' + (DB._db ? 'ok' : DB._ls ? 'respaldo' : 'no'));
 })();
 </script>
 </body>
