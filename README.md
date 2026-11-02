@@ -1,7 +1,7 @@
 📺 DJ-IPTV
 Cliente IPTV 100% navegador · Estilo Apple TV (tvOS) · Un solo archivo HTML
 
-🌐 Sitio web: https://www.dj-iptv.pages.dev
+🌐 Sitio web: https://dj-iptv.pages.dev/
 
 DJ-IPTV es un cliente IPTV que funciona directamente en tu navegador, sin instalar
 nada: ni apps, ni Node.js, ni Python, ni emuladores de Android. Está pensado
@@ -26,7 +26,7 @@ de proveedores IPTV): TV en vivo, películas y series.
 🧪 Modo demo para probar sin cuenta
 🌍 Funciona con doble clic en index.html (sin servidor) o publicado en la nube
 🚀 Cómo usarlo
-Abre https://www.dj-iptv.pages.dev
+Abre https://dj-iptv.pages.dev/
 Pulsa «Añadir cuenta» y escribe los datos de tu proveedor Xtream:
 Host (ej. http://miservidor.tv)
 Puerto (ej. 8080 o 80)
