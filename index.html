@@ -5987,6 +5987,53 @@ const Player = {
  * Vistas Descargas y Ajustes · Teclado global · Bootstrap
  * ============================================================ */
 
+/* ---------- Screen Wake Lock (pantalla activa en descargas y grabaciones) ----------
+ * navigator.wakeLock.request('screen') evita que el sistema suspenda el dispositivo
+ * (y con ello la interfaz de red) durante transferencias largas de MKV/MP4 o grabación
+ * PVR de un directo. El navegador libera el bloqueo al ocultar la pestaña:
+ * visibilitychange lo re-adquiere al volver; al ocultar, persistimos el progreso. */
+const WakeLock = {
+  _sentinel: null,
+  _pending: false,
+  _wants: { dl: false, pvr: false },
+
+  supported() { return 'wakeLock' in navigator; },
+
+  _req() {
+    if (!this.supported() || this._sentinel || this._pending) return;
+    this._pending = true;
+    const self = this;
+    navigator.wakeLock.request('screen').then(function (s) {
+      self._sentinel = s;
+      self._pending = false;
+      s.addEventListener('release', function () { if (self._sentinel === s) self._sentinel = null; });
+    }).catch(function () { self._pending = false; /* denegado o pantalla inactiva: sin bloqueo */ });
+  },
+
+  _rel() {
+    if (this._sentinel) {
+      const s = this._sentinel;
+      this._sentinel = null;
+      try { s.release(); } catch (_e) { /* noop */ }
+    }
+  },
+
+  /** Origen de la necesidad: 'dl' (descargas) o 'pvr' (grabación). Activa si alguno pide. */
+  set(who, on) {
+    this._wants[who] = !!on;
+    if (this._wants.dl || this._wants.pvr) this._req();
+    else this._rel();
+  },
+};
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    WakeLock._req();                    // el navegador lo soltó al ocultar: re-adquiere
+  } else {
+    DL.persistAll();                    // persistencia en segundo plano (reanudable tras recarga)
+  }
+});
+
 /* ---------- Motor de descargas ---------- */
 const DL = {
   items: new Map(),
@@ -6016,6 +6063,7 @@ const DL = {
     while (this._running < this.MAX && this._queue.length) {
       const it = this._queue.shift();
       this._running++;
+      WakeLock.set('dl', true);     // transferencia en marcha → pantalla activa
       this._run(it);
     }
   },
@@ -6055,6 +6103,7 @@ const DL = {
       }
     } finally {
       this._running--;
+      WakeLock.set('dl', this._running > 0);   // sin transferencias → soltar la pantalla
       this._ui();
       this._pump();
     }
@@ -6239,6 +6288,14 @@ const DL = {
     }
     else { base.chunks = it.chunks.slice(); }
     DB.put('downloads', base).catch(() => { /* cuota llena */ });
+  },
+
+  /** Volcado inmediato del progreso de todas las transferencias
+   *  (al ir a segundo plano, antes de cerrar la pestaña o recargar). */
+  persistAll() {
+    for (const it of this.items.values()) {
+      if (it.state === 'active') this._persist(it);
+    }
   },
 
   pause(id) {
@@ -6443,8 +6500,14 @@ const PVR = {
       }
     };
     this.rec.start(1000);           // fragmentos cada segundo
+    // Si la señal muere (corte de red / fin del directo), la grabación se cierra
+    // sola y conserva lo capturado hasta el momento.
+    const endAll = () => { if (this.active) this.stop(); };
+    const tracks = stream.getVideoTracks().concat(stream.getAudioTracks());
+    for (const t of tracks) t.addEventListener('ended', endAll);
     this.startedAt = Date.now();
     this.active = true;
+    WakeLock.set('pvr', true);      // pantalla activa mientras graba
     player.el.rec.hidden = false;
     player.el.record.classList.add('rec-on');
     clearInterval(this.timer);
@@ -6457,11 +6520,15 @@ const PVR = {
   async stop() {
     if (!this.active || !this.rec) return null;
     const rec = this.rec;
-    const stopped = new Promise(res => { rec.onstop = res; });
+    const stopped = new Promise(res => {
+      if (rec.state !== 'recording' && rec.state !== 'paused') res();  // ya parado (la señal terminó antes)
+      else rec.onstop = res;
+    });
     try { rec.stop(); } catch (_e) { /* noop */ }
     await stopped;
     clearInterval(this.timer);
     this.active = false;
+    WakeLock.set('pvr', false);     // grabación terminada → soltar la pantalla
     Player.el.rec.hidden = true;
     Player.el.record.classList.remove('rec-on');
     try { await this.wchain; } catch (_e) { /* noop */ }
